@@ -241,7 +241,8 @@ async function disposeWorkspace(ctx: Context, root: string): Promise<void> {
   state.entries.clear()
 }
 
-/** 会话进入工作空间时：无 .dsh/mcps → 卸载；有 → 扫描并按需挂载。
+/**
+ * 会话进入工作空间时：无 .dsh/mcps → 卸载；有 → 扫描并按需挂载。
  * 记录「最近进入的工作空间」（活动工作区，随会话切换更新）。 */
 async function ensureWorkspace(ctx: Context, root: string): Promise<void> {
   // 会话切换即刷新活动工作区（即使该目录没有项目 MCP，也是当前所处工作区）
@@ -339,14 +340,36 @@ export function installProjectMcp(ctx: Context): () => void {
   const disposers: Array<() => void> = []
   disposers.push(
     ctx.effect(() => {
-      const off = ctx.root.on('agent/session-start', (payload: { agent?: { session?: { header?: { cwd?: unknown } } } }) => {
+      // ⚠️ 0.2.0 事件改名（0.7.0 修复，2026-10 实测）：0.1.x 由 `dsh-agent-loop`
+      // 发 `agent/session-start`；0.2.0 起该事件**整个消失**（全量扫 app.asar 零命中），
+      // 改由 `dsh-agent` 在注册活 agent 时发 **`agent/created`**
+      // （dsh-agent/lib/index.js:579 `ctx.serial(carrier, "agent/created", { agent, source, signal })`；
+      //  api-catalog: payload `{ agent: Agent; source: SessionStartSource; signal?: AbortSignal }`，
+      //  source = 'startup' | 'resume' | 'clear' | 'compact'）。
+      //
+      // 症状（本 bug）：只监听旧名 ⇒ 0.2.0 上**永不触发** ⇒ 重启后没有任何东西重建
+      // 项目 MCP 行（根 loader 树 cordis.yml 每次启动重置为 []），而项目 MCP 的持久化
+      // 只有 mcp.json 一个来源 ⇒ 面板添加后当次可见（走 remountWorkspace 直挂），
+      // 重启即消失。**不是文件没写、也不是路径不对，是重建时机的事件名过时了。**
+      //
+      // 两个名字都挂：它们语义相同（会话进入工作空间），且 0.1.x 下发 agent/created
+      // 无人消费、0.2.0 下发 agent/session-start 无人发 —— 各版本各命中一个，互不影响。
+      const onSessionStart = (payload: {
+        agent?: { session?: { header?: { cwd?: unknown } } }
+      }): void => {
         const cwd = payload?.agent?.session?.header?.cwd
         if (typeof cwd !== 'string' || cwd.length === 0) return
         void ensureWorkspace(ctx, cwd).catch((error) => {
           ctx.logger.warn?.(`mcp-skill-panel: 项目 MCP 挂载失败（${cwd}）: ${messageOf(error)}`)
         })
-      })
-      return off
+      }
+      const offs = [
+        ctx.root.on('agent/created', onSessionStart),
+        ctx.root.on('agent/session-start', onSessionStart),
+      ]
+      return () => {
+        for (const off of offs) off()
+      }
     }, 'mcp-skill-panel: project mcp session hook'),
   )
   disposers.push(installProjectMcpVisibility(ctx))

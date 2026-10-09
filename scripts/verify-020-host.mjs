@@ -146,6 +146,55 @@ check(bundle.includes('createRequire'), '经 createRequire 动态解析（保住
 check(bundle.includes('@deepseek-ai/dsh-agent-preset-registry') && bundle.includes('@deepseek-ai/dsh-agent-presets'),
   '两个候选包名都在产物里（0.1.x 回落未被摇掉）');
 
+// ── ⑥ 事件契约：插件监听的会话边界事件必须真的由宿主发出 ────────────────────
+// 为什么需要这一条（2026-10 实测事故）：0.2.0 把 `agent/session-start` 整个删掉，
+// 换成 `agent/created`。插件仍监听旧名 ⇒ 在 0.2.0 上**永不触发** ⇒ 重启后项目 MCP
+// 行不再重建（面板添加当次可见、重启即消失），且「下次会话生效」也永不生效。
+// 这类「监听宿主不再发出的事件」是**静默失效**：不报错、不告警，只在重启后暴露；
+// 本仓其它闸门都看不到，故在此设卡。
+console.log('\n=== ⑥ 会话边界事件契约（宿主是否真的发出插件监听的事件）===');
+{
+  const fd2 = fs.openSync(ASAR, 'r');
+  const h = Buffer.alloc(16); fs.readSync(fd2, h, 0, 16, 0);
+  const js = h.readUInt32LE(12);
+  const jb = Buffer.alloc(js); fs.readSync(fd2, jb, 0, js, 16);
+  const hdr2 = JSON.parse(jb.toString('utf8'));
+  const base2 = 16 + js;
+  const emits = new Set();
+  const readN = (n) => {
+    if (!n || n.offset === undefined) return null; // asar 里的 symlink 条目没有 offset
+    const b = Buffer.alloc(Number(n.size)); fs.readSync(fd2, b, 0, Number(n.size), base2 + Number(n.offset)); return b.toString('utf8');
+  };
+  // 只看 @deepseek-ai 官方包，避免第三方包的同名噪声
+  const walk2 = (node, p, isDsh) => {
+    for (const [k, v] of Object.entries(node.files || {})) {
+      if (v.files) { walk2(v, p + '/' + k, isDsh || k.startsWith('@deepseek-ai')); continue; }
+      if (!isDsh || !/\.(js|mjs)$/.test(k)) continue;
+      const t = readN(v);
+      if (t === null) continue;
+      for (const m of t.matchAll(/["'`]((?:agent|session|workspace)\/[a-z-]+)["'`]/g)) emits.add(m[1]);
+    }
+  };
+  walk2(hdr2.files.dsh.files.node_modules, '', false);
+  fs.closeSync(fd2);
+
+  const listened = [...new Set([...bundle.matchAll(/\.on\(\s*["']((?:agent|session|workspace)\/[a-z-]+)["']/g)].map((m) => m[1]))];
+  console.log('  插件监听: ' + listened.join(', '));
+  const live = listened.filter((ev) => emits.has(ev));
+  const dead = listened.filter((ev) => !emits.has(ev));
+  // 判据是「**至少有一个**监听的事件在宿主侧是活的」，不是「每个都必须活」：
+  // 监听一个不存在的事件是**无害**的（cordis 照常注册，永不触发），而为了同时支持
+  // 0.1.x 与 0.2.x，插件**必须**同时挂两个名字 —— 各版本各命中一个。
+  // 真正的事故形态是「挂的名字**全**是死的」（0.2.0 上只挂 agent/session-start 就是如此），
+  // 那会让整条链路静默失效。故这里只把「全死」判为失败。
+  check(live.length > 0, '至少一个被监听的会话边界事件在宿主侧是活的',
+    live.length > 0 ? `live=${live.join(', ')}` : '全部监听都是死事件 —— 整条链路静默失效');
+  if (dead.length > 0) {
+    console.log(`  note 兼容性监听（本版本宿主不发，供其它 DSH 版本用）: ${dead.join(', ')}`);
+  }
+  check(emits.has('agent/created'), '宿主侧确认存在 agent/created（0.2.0 的会话边界事件，遵循它而非猜）');
+}
+
 fs.rmSync(WORK, { recursive: true, force: true });
 console.log('\n临时目录已清理。');
 console.log(failed ? '\nRESULT: FAILED' : '\nRESULT: ALL PASS');

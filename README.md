@@ -312,6 +312,56 @@ node 半区 tsdown 必须 `external: [/^@deepseek-ai\//]`：内联 dsh-tools 会
 
 ## 📋 变更日志
 
+### v0.7.1（2026-10）— 项目级 MCP 重启后消失（0.2.0 事件改名，静默失效）
+
+> 症状（用户实测）：面板「添加 MCP → 项目」成功、当次可见；**重启 DSH Desktop 后项目 MCP 全没了**。
+> `mcp.json` 文件内容完好（8 个 server 都在），所以**不是没写盘、也不是路径不对**。
+
+#### 根因：`agent/session-start` 在 0.2.0 里已不存在
+
+项目 MCP 的行来源只有 `<workspace>/.dsh/mcps/mcp.json`；运行期行挂在**根 loader 树**上，
+而根树 backing 文件 `cordis.yml` 每次启动被重置为 `[]`（该文件里没有任何 `projmcp-*` 行 = 实证）。
+所以每次启动**必须重建**这些行 —— 重建的唯一入口是「会话进入工作空间」的事件钩子。
+
+```js
+// 0.1.x：dsh-agent-loop 发
+emitAgentEvent(loopCtx, agent, "agent/session-start", { source })
+// 0.2.0：该事件整个消失（全量扫 app.asar 零命中），改由 dsh-agent 发
+await this.ctx.serial(entry.carrier, "agent/created", { agent, source, signal })
+//   api-catalog: payload { agent: Agent; source: SessionStartSource; signal?: AbortSignal }
+//   SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'
+```
+
+插件只监听旧名 ⇒ 0.2.0 上**永不触发** ⇒ 重启后没有任何东西重建项目 MCP 行。
+这也解释了「面板添加当次可见」：那条路径走 `remountWorkspace()` 直接挂载，**不经过事件**。
+
+同时中招的第二处：`index.ts` 的**「下次会话生效」（next-session）** 边界应用挂在同一个死事件上
+⇒ 0.2.0 上待生效队列永不应用（一直悬着，要等重启才由 `syncPresetFiles` 兜底）。
+
+#### 修法：两个名字都挂
+
+`agent/session-start` 与 `agent/created` 语义相同（会话进入工作空间），且
+**0.1.x 下 `agent/created` 无人消费、0.2.0 下 `agent/session-start` 无人发**
+—— 各版本各命中一个，互不影响；重复触发由既有 guard 吸收。
+
+- `project-mcp.ts`：会话钩子改为双事件名 + 同一 handler。
+- `index.ts`：next-session 边界应用同样双挂。
+- **cwd 取法无需改动**：0.2.0 的正确路径就是 `agent.session.header.cwd`
+  （见 `dsh-hooks-claude-code` 的 `base()`：`cwd: agent?.session.header.cwd ?? process.cwd()`），
+  与旧 payload 的 `payload.agent.session.header.cwd` **完全同路径**。
+
+#### 新增护栏：事件契约必须对着宿主实测
+
+这类「监听宿主不再发出的事件」是**静默失效** —— 不报错、不告警，只在重启后暴露；
+本仓原有闸门（typecheck / build / verify / selftest）**全都看不到**。故在
+`npm run verify:host020` 里加了第 ⑥ 组断言：从 app.asar 全量扫出宿主**真的会发出**的
+`agent|session|workspace/*` 事件，与产物里 `.on(...)` 实际监听的集合求交。
+
+判据是「**至少有一个**被监听的事件在宿主侧是活的」，而非「每个都必须活」——
+监听一个不存在的事件是无害的（cordis 照常注册、永不触发），而为了同时支持 0.1.x 与 0.2.x
+**必须**同时挂两个名字；真正的事故形态是「挂的名字**全**是死的」。已反向验证：
+把监听恢复成只挂 `agent/session-start`，这条护栏会 FAIL。
+
 ### v0.7.0（2026-10）— DSH 0.2.0 适配（数据源迁移）+ 桌面端可安装
 
 > 触发场景：在 **DSH Desktop 0.2.0-rc.2** 上安装本插件时，桌面插件管理器直接拒绝：

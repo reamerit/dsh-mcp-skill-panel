@@ -890,32 +890,36 @@ export function apply(ctx: Context, config: Config = {}): void {
   })
 
   // P1 会话边界生效（v0.5.0）：next-session 模式下，新会话首次请求前应用待生效队列。
-  // agent/session-start 是 Scoped<Agent> 的 emit，root 监听可收到；应用失败保留队列，
-  // 由下次边界或「立即应用」端点重试。entry.update 触发 tools/change → 新会话前缀自建
-  // （无缓存可破坏）。immediate 模式不产生待办，此监听零副作用。
+  // 应用失败保留队列，由下次边界或「立即应用」端点重试。entry.update 触发 tools/change
+  // → 新会话前缀自建（无缓存可破坏）。immediate 模式不产生待办，此监听零副作用。
+  //
+  // ⚠️ 0.7.0 事件改名：0.2.0 起 `agent/session-start` 不再被发出（全量扫 app.asar 零命中），
+  // 替代者是 `dsh-agent` 的 `agent/created`。只挂旧名会让**「下次会话生效」在 0.2.0 上永不生效**
+  // （队列一直悬着，直到重启才由 syncPresetFiles 兜底）—— 与项目 MCP 消失同一根因。
+  // 两个名字都挂：各版本各命中一个，重复触发由 guard 吸收。
   ctx.effect(() => {
     let guard = false
-    const off = ctx.root.on(
-      'agent/session-start',
-      () => {
-        if (guard) return
-        guard = true
-        void applyPendingMcp({ ctx, controller })
-          .then((count) => {
-            if (count > 0) {
-              caches.invalidateMcp()
-              ctx.logger.info(`runtime-inventory: applied ${count} pending MCP change(s) at session boundary`)
-            }
-          })
-          .catch((error: unknown) => {
-            ctx.logger.warn(`runtime-inventory: session-boundary apply failed: ${messageOf(error)}`)
-          })
-          .finally(() => {
-            guard = false
-          })
-      },
-    )
-    return off
+    const onBoundary = () => {
+      if (guard) return
+      guard = true
+      void applyPendingMcp({ ctx, controller })
+        .then((count) => {
+          if (count > 0) {
+            caches.invalidateMcp()
+            ctx.logger.info(`runtime-inventory: applied ${count} pending MCP change(s) at session boundary`)
+          }
+        })
+        .catch((error: unknown) => {
+          ctx.logger.warn(`runtime-inventory: session-boundary apply failed: ${messageOf(error)}`)
+        })
+        .finally(() => {
+          guard = false
+        })
+    }
+    const offs = [ctx.root.on('agent/created', onBoundary), ctx.root.on('agent/session-start', onBoundary)]
+    return () => {
+      for (const off of offs) off()
+    }
   }, 'runtime-inventory: session-boundary apply')
 
   ctx.inject(['webServer'], (httpCtx) => {
