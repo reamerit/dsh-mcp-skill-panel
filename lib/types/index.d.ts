@@ -41,7 +41,8 @@ export type { DomainCaches } from './collect';
 export { mergeSchemas, computeStatus, rowDisplay } from './collect';
 export { setRowFlag, setSkillFlag, rowDisabledState, syncPresetFiles, isValidSkillName, buildSkillMd } from './preset';
 export { scanWorkspaceMcp } from './project-mcp';
-export { installProjectMcp, remountWorkspace, projectServerOwner, projectServerName } from './project-mcp';
+export { installProjectMcp, remountWorkspace, projectServerOwner, projectServerName, disposeAllWorkspaces } from './project-mcp';
+export { projectVisibilityDiag, type ProjectVisibilityDiag } from './project-mcp';
 export { createGatewayState, isolateChildScope, decideMount, checkChildVisible, disposeGatewayState, disposeGatewayStateSync, ensureOpenMounts, gatewayEntryId, gatewayServerOfEntryId, GATEWAY_ENTRY_PREFIX } from './gateway';
 export type { GatewayState, EnsureOpenMountsResult } from './gateway';
 /** P5（D5）：/debug 只读网关挂载面（无 secrets）。模块级单例由 apply 赋值。 */

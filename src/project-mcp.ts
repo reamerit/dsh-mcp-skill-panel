@@ -297,6 +297,45 @@ async function refresh(ctx: Context, root: string, state: WorkspaceState): Promi
 /* ── 可见性过滤（常开，独立于 autoManage） ────────────────────────────── */
 
 /**
+ * 上一次装配的可见性判定痕迹（诊断用；`/debug` 的 `projectVisibilityDiag` 读它）。
+ *
+ * 为什么需要它：面板读的是 `ctx.loader.entries()`，而过滤读的是本模块的
+ * `projectOwners`。两者**可以不一致** —— 若 `projectOwners` 为空，过滤会在
+ * 快速通道 `return next()` 直接放行，**所有项目 MCP 工具泄露给每一个会话**，
+ * 而面板看起来一切正常。这条痕迹就是为区分「接管了但判错工作区」与
+ * 「根本没接管（表为空）」而设，避免靠猜。
+ */
+export interface ProjectVisibilityDiag {
+  /** 判定执行次数 */
+  assembled: number
+  /** 因 projectOwners 为空而整体放行（快速通道）的次数 */
+  bypassed: number
+  /** 最近一次判定的台账（最多 20 条） */
+  recent: Array<{
+    at: number
+    /** 会话 cwd（= 判定用的 workspace）；undefined 表示没取到 agent/session/cwd */
+    workspace: string | null
+    /** 该次装配里被识别为项目 MCP 的 server */
+    projectServers: string[]
+    /** owner === workspace 的 server（保留） */
+    visible: string[]
+    /** owner !== workspace 的 server（过滤掉） */
+    hidden: string[]
+    /** 建表时的 projectOwners 快照 */
+    owners: Record<string, string>
+  }>
+  /** 当前 projectOwners 全量（工作区 → 无，仅需要键值对） */
+  ownersNow: Record<string, string>
+}
+
+const visibilityDiag: ProjectVisibilityDiag = { assembled: 0, bypassed: 0, recent: [], ownersNow: {} }
+
+/** 诊断读数（只读快照）。 */
+export function projectVisibilityDiag(): ProjectVisibilityDiag {
+  return { ...visibilityDiag, recent: visibilityDiag.recent.map((r) => ({ ...r })), ownersNow: Object.fromEntries(projectOwners) }
+}
+
+/**
  * 常开过滤：项目 MCP 工具仅在本工作空间会话的装配结果中可见。
  * 非项目 MCP 工具不在此处理（交给 autoManage 的过滤器）。
  */
@@ -311,9 +350,16 @@ function installProjectMcpVisibility(ctx: Context): () => void {
       ): Promise<PromptAssembly> => {
         if (assembly && Array.isArray(assembly.tools)) {
           // 快速通道：无任何项目 MCP 行时零开销放行（默认场景）
-          if (projectOwners.size === 0) return next()
+          if (projectOwners.size === 0) {
+            visibilityDiag.bypassed += 1
+            return next()
+          }
           const cwd = (context as { agent?: { session?: { header?: { cwd?: unknown } } } } | undefined)?.agent?.session?.header?.cwd
           const workspace = typeof cwd === 'string' ? cwd : null
+          const ownersSnap = Object.fromEntries(projectOwners)
+          const projectServers: string[] = []
+          const visible: string[] = []
+          const hidden: string[] = []
           assembly.tools = assembly.tools.filter((tool) => {
             const name = String(tool?.name ?? '')
             if (!name.startsWith('mcp__')) return true
@@ -323,16 +369,47 @@ function installProjectMcpVisibility(ctx: Context): () => void {
             const owner = projectOwners.get(server)
             // 非项目 MCP：交给 autoManage 过滤器
             if (owner === undefined) return true
+            if (!projectServers.includes(server)) projectServers.push(server)
             // 项目 MCP：仅本项目（活动工作空间）会话可见；无会话上下文时隐藏
             // Windows 路径大小写不敏感（c:\ 与 C:\ 视为同一工作区）
-            return workspace !== null && strEquals(workspace, owner, 'ignorecase')
+            const keep = workspace !== null && strEquals(workspace, owner, 'ignorecase')
+            if (keep) {
+              if (!visible.includes(server)) visible.push(server)
+              return true
+            }
+            if (!hidden.includes(server)) hidden.push(server)
+            return false
           })
+          visibilityDiag.assembled += 1
+          visibilityDiag.ownersNow = ownersSnap
+          visibilityDiag.recent.push({ at: Date.now(), workspace, projectServers, visible, hidden, owners: ownersSnap })
+          if (visibilityDiag.recent.length > 20) visibilityDiag.recent.shift()
         }
         return next()
       },
     )
     return off
   }, 'mcp-skill-panel: project mcp visibility')
+}
+
+/**
+ * 释放全部工作空间的运行时资源（watcher + 已挂载行）。
+ *
+ * 为什么需要它（0.7.2 修的真实缺口）：`installProjectMcp` 的 teardown 此前只
+ * `dispose()` 两个 effect，**从不关 `fs.watch` 句柄**，也不摘掉 `projmcp-*` 行。
+ * 后果：插件卸载 / HMR 重载后 watcher 泄漏（每个已激活工作区一个句柄，且回调仍
+ * 持有旧 ctx）；单测里更直接 —— 进程因为活跃的 fs.watch 永不退出。
+ * @param ctx - 宿主上下文。
+ * @returns 释放完成（行移除失败只记日志，不抛）。
+ */
+export async function disposeAllWorkspaces(ctx: Context): Promise<void> {
+  for (const root of [...workspaces.keys()]) {
+    try {
+      await disposeWorkspace(ctx, root)
+    } catch (error) {
+      ctx.logger.warn?.(`mcp-skill-panel: 释放项目 MCP 工作区失败（${root}）: ${messageOf(error)}`)
+    }
+  }
 }
 
 /** 安装项目 MCP 运行时：会话挂载 + 常开过滤。返回整体释放函数。 */
@@ -375,6 +452,9 @@ export function installProjectMcp(ctx: Context): () => void {
   disposers.push(installProjectMcpVisibility(ctx))
   return () => {
     for (const dispose of disposers) dispose()
+    // 0.7.2：teardown 必须同时释放工作区资源 —— 否则 fs.watch 句柄泄漏，
+    // 且回调继续持有旧 ctx（HMR 后指向已卸载的树）。
+    void disposeAllWorkspaces(ctx).catch(() => {})
   }
 }
 

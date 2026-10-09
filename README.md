@@ -312,6 +312,62 @@ node 半区 tsdown 必须 `external: [/^@deepseek-ai\//]`：内联 dsh-tools 会
 
 ## 📋 变更日志
 
+### v0.7.2（2026-10）— 项目 MCP 跨工作区可见性：补上此前完全没有测试的那条链路
+
+> 触发场景：用户在 `github` 工作区配好项目 MCP，发现**在别的工作区的会话里（新建或继续）
+> 也能看到并调用这些工具**。
+
+#### 查证结论：可见性**判据**本身是对的，缺的是测试与现场取证面
+
+按「先证伪再结论」逐条排除，全部有据：
+
+| 怀疑点 | 查证结果 |
+| --- | --- |
+| `system-prompt/assemble` 在 0.2.0 是否还在 | **在**。4 处消费 + `dsh-system-prompt` 的 waterfall emit，签名不变 |
+| 过滤器是否被 `autoManage` 开关挡住 | **不会**。`installProjectMcp` 在 `apply` 里**无条件**安装，位于 `applyAutoManage` 的 `needed` 分支之外 |
+| `context.agent` 是否可达 | **可达**。`assembleContextFor(agent, signal)` 返回 `{ agent, scope, … }`，**无条件**带 `agent`；DSH 自己的 `dsh-agent-loop:1566` 就用同一路径 `context.agent?.session.header.cwd` |
+| 面板可见是否等于过滤生效 | **不等于**（关键）。面板读 `ctx.loader.entries()`，过滤读本模块的 `projectOwners` —— 两者可以不一致 |
+| 是否全局行在泄露 | **否**。实测桌面 profile 的 `cordis.patch.yml` **零** MCP 行（根本无全局行可泄露） |
+| 判据本身是否有 bug | **没有**。见下方新增单测，断言全过 |
+
+**真正的失效形态**：`projectOwners` 若为空，过滤在快速通道 `if (projectOwners.size === 0) return next()`
+**整体放行** ⇒ 所有项目工具泄露给每一个会话，而**面板看起来完全正常**。已用反向验证确认：
+该形态下装配结果确实带上项目工具（`["mcp__alpha-…","read"]`），台账呈 `assembled=0 / bypassed=1`。
+
+#### 新增：`/debug` 的 `projectVisibility`（现场取证面）
+
+不靠猜。`GET /api/mcp-skill-panel/debug` 现在带：
+
+```jsonc
+"projectVisibility": {
+  "assembled": 5,      // 真正执行过判定的次数
+  "bypassed": 0,       // 因 projectOwners 为空而整体放行的次数
+  "recent": [ { "workspace": "<会话 cwd>", "projectServers": [...], "visible": [...], "hidden": [...], "owners": {...} } ],
+  "ownersNow": { "<serverName-哈希>": "<所属工作区>" }
+}
+```
+
+判读：
+- `bypassed > 0 且 assembled == 0` ⇒ **projectOwners 为空、过滤整体放行**（即上面的失效形态）
+- `recent[].workspace` 与会话实际 cwd 不符 ⇒ 取 cwd 的链路有问题
+- `ownersNow` 为空 ⇒ 挂载根本没把 owner 登记进去
+
+#### 新增：`npm run selftest:project`（此前该链路零测试）
+
+`scripts/check-project-visibility.mjs` 驱动**真实挂载链路**（`remountWorkspace` → `scanWorkspaceMcp`
+→ `syncRows` → `projectOwners`）再喂装配，覆盖：两个工作区互不可见、第三方工作区看不到任何项目工具、
+无会话上下文时隐藏、Windows 路径大小写不敏感、台账必须执行过判定而非走快速通道、teardown 后 owner 清空。
+
+> ⚠️ 写这条测试时踩到一个 waterfall 语义坑，值得记下来：**`next` 必须回吐同一个 `assembly`
+> 对象**。handler 是就地改 `assembly` 再调 `next()`，返回值即 `next()` 的结果；回吐一个
+> 新建对象会丢掉 handler 的改动 —— 第一版就这么写，把插件的正确行为误报成「把工具全删了」。
+
+#### 顺带修掉一个真实缺口：teardown 泄漏 `fs.watch`
+
+`installProjectMcp` 的 teardown 此前只 `dispose()` 两个 effect，**从不关 `fs.watch` 句柄**，
+也不摘掉已挂载的 `projmcp-*` 行。后果：插件卸载 / HMR 重载后每个已激活工作区泄漏一个 watcher，
+且回调继续持有旧 ctx（指向已卸载的树）。新增并导出 `disposeAllWorkspaces(ctx)`，由 teardown 调用。
+
 ### v0.7.1（2026-10）— 项目级 MCP 重启后消失（0.2.0 事件改名，静默失效）
 
 > 症状（用户实测）：面板「添加 MCP → 项目」成功、当次可见；**重启 DSH Desktop 后项目 MCP 全没了**。

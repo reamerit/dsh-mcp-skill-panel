@@ -70,7 +70,8 @@ export { setRowFlag, setSkillFlag, rowDisabledState, syncPresetFiles, isValidSki
 // 项目 MCP 扫描（selftest 回归护栏：根目录先读、子目录覆盖的去重规则）
 export { scanWorkspaceMcp } from './project-mcp'
 // 项目 MCP 运行时装配（外部复用/端到端验证：手动安装、按工作空间重扫、owner 查询）
-export { installProjectMcp, remountWorkspace, projectServerOwner, projectServerName } from './project-mcp'
+export { installProjectMcp, remountWorkspace, projectServerOwner, projectServerName, disposeAllWorkspaces } from './project-mcp'
+export { projectVisibilityDiag, type ProjectVisibilityDiag } from './project-mcp'
 // P4 网关常驻态（自测回归护栏：挂载决策/视野隔离/自检断言纯逻辑）
 export { createGatewayState, isolateChildScope, decideMount, checkChildVisible, disposeGatewayState, disposeGatewayStateSync, ensureOpenMounts, gatewayEntryId, gatewayServerOfEntryId, GATEWAY_ENTRY_PREFIX } from './gateway'
 export type { GatewayState, EnsureOpenMountsResult } from './gateway'

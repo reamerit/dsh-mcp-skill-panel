@@ -40,6 +40,7 @@ async function findPresetRowByServerNameLike(ctx: Context, serverName: string) {
 import { resolveAgent, resolveCollectScopeKey, scopeKeySource, getSchemasView, mergeSchemas, collectMcp, collectSkills, confirmedSkills, pruneExpired, DOMAIN_TTL_MS, SKILL_TOGGLE_POLL_MS, type DomainCaches, type Deps } from './collect'
 import { isMcpEntry, serverNameOf } from './mcp-entry'
 import { findStandingEntryById, standingDiag, standingMcpEntries, findStandingEntryByServer, presetIdOfEntry } from './standing-rows'
+import { projectVisibilityDiag } from './project-mcp'
 import { parseMcpServersJson, serversToPatchYaml, serversToRows, type McpServers, type McpRowConfig } from './mcp-convert'
 import { remountWorkspace, projectServerOwner, getActiveWorkspace } from './project-mcp'
 import { disabledToolsOf, setToolDisabled, setToolsDisabledBulk, resolveToolBulkTargets } from './tool-disable'
@@ -1311,6 +1312,12 @@ export function makeRoutes(
           // = 宿主 livePresetMounts() 看不到挂载（模块身份错位或宿主未挂 preset）；
           // `lastRowCount` 应为 preset 里的 MCP 行数（本机 10）。
           standingDiag: standingDiag(),
+          // 0.7.2：项目 MCP **可见性判定**的现场台账。
+          // 面板读的是 `ctx.loader.entries()`，而过滤读的是 project-mcp 的
+          // `projectOwners` —— 两者可以不一致。若 `bypassed > 0` 且 `assembled == 0`，
+          // 说明 projectOwners 为空、过滤走快速通道**整体放行**（项目工具泄露给所有会话），
+          // 而面板看起来完全正常。`recent[].workspace` 是判定用的会话 cwd。
+          projectVisibility: projectVisibilityDiag(),
           ...(controller ? { controllerStatus: controller } : {}),
           ...(inventory !== undefined ? { inventoryTrace: inventory } : {}),
           ...(reaper !== undefined ? { reaper } : {}),

@@ -45,6 +45,50 @@ export declare function scanWorkspaceMcp(root: string, warn?: (message: string) 
  * 原名超过 23 字符时截断尾部（保留头部可读性），总长收敛到 ≤32。
  */
 export declare function projectServerName(root: string, name: string): string;
+/**
+ * 上一次装配的可见性判定痕迹（诊断用；`/debug` 的 `projectVisibilityDiag` 读它）。
+ *
+ * 为什么需要它：面板读的是 `ctx.loader.entries()`，而过滤读的是本模块的
+ * `projectOwners`。两者**可以不一致** —— 若 `projectOwners` 为空，过滤会在
+ * 快速通道 `return next()` 直接放行，**所有项目 MCP 工具泄露给每一个会话**，
+ * 而面板看起来一切正常。这条痕迹就是为区分「接管了但判错工作区」与
+ * 「根本没接管（表为空）」而设，避免靠猜。
+ */
+export interface ProjectVisibilityDiag {
+    /** 判定执行次数 */
+    assembled: number;
+    /** 因 projectOwners 为空而整体放行（快速通道）的次数 */
+    bypassed: number;
+    /** 最近一次判定的台账（最多 20 条） */
+    recent: Array<{
+        at: number;
+        /** 会话 cwd（= 判定用的 workspace）；undefined 表示没取到 agent/session/cwd */
+        workspace: string | null;
+        /** 该次装配里被识别为项目 MCP 的 server */
+        projectServers: string[];
+        /** owner === workspace 的 server（保留） */
+        visible: string[];
+        /** owner !== workspace 的 server（过滤掉） */
+        hidden: string[];
+        /** 建表时的 projectOwners 快照 */
+        owners: Record<string, string>;
+    }>;
+    /** 当前 projectOwners 全量（工作区 → 无，仅需要键值对） */
+    ownersNow: Record<string, string>;
+}
+/** 诊断读数（只读快照）。 */
+export declare function projectVisibilityDiag(): ProjectVisibilityDiag;
+/**
+ * 释放全部工作空间的运行时资源（watcher + 已挂载行）。
+ *
+ * 为什么需要它（0.7.2 修的真实缺口）：`installProjectMcp` 的 teardown 此前只
+ * `dispose()` 两个 effect，**从不关 `fs.watch` 句柄**，也不摘掉 `projmcp-*` 行。
+ * 后果：插件卸载 / HMR 重载后 watcher 泄漏（每个已激活工作区一个句柄，且回调仍
+ * 持有旧 ctx）；单测里更直接 —— 进程因为活跃的 fs.watch 永不退出。
+ * @param ctx - 宿主上下文。
+ * @returns 释放完成（行移除失败只记日志，不抛）。
+ */
+export declare function disposeAllWorkspaces(ctx: Context): Promise<void>;
 /** 安装项目 MCP 运行时：会话挂载 + 常开过滤。返回整体释放函数。 */
 export declare function installProjectMcp(ctx: Context): () => void;
 /** 面板添加/外部修改项目 MCP 文件后，强制重扫该工作空间并同步挂载（幂等）。 */
