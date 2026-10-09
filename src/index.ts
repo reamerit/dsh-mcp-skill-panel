@@ -39,7 +39,8 @@ import { installMcpVisibilityFilter, type AssemblyGate } from './filter'
 import type { McpControlCtx, McpCallController } from './mcpcall'
 import { createMcpCallController, installMcpControlTools, inventoryTraceDiag } from './mcpcall'
 import { isMcpEntry, serverNameOf, mcpEntryConfig } from './mcp-entry'
-import { standingMcpEntries, findStandingEntryByServer, installedMcpRows } from './standing-rows'
+import { standingMcpEntries, findStandingEntryByServer, installedMcpRows, ensureAgentPresetApi } from './standing-rows'
+import { presetApiDiag } from './agent-preset-compat'
 import { createGatewayState, disposeGatewayState, disposeGatewayStateSync, ensureOpenMounts } from './gateway'
 
 export { normalizeToolName, normalizeArguments, msgOf, gatewayCall } from './mcpcall'
@@ -103,8 +104,27 @@ export function controllerStatusForDebug(): {
 }
 
 /** 0.6.3：能力表采集的逐阶段痕迹（/debug 的 inventoryTrace）。 */
-export function inventoryTraceForDebug(): unknown {
-  return inventoryTraceDiag()
+/**
+ * agent-presets 模块解析诊断（selftest / 装机排障；不参与任何逻辑判断）。
+ *
+ * 回答「本插件解析到的是哪一份实例」——`livePresetMounts()` 的挂载表是包内
+ * **模块私有** Set，解析错实例的后果是静默空表（面板 MCP 行全空），不是报错。
+ */
+export function agentPresetApiForDebug(): {
+  specifier: string | null
+  resolvedPath: string | null
+  base: string
+  errors: string[]
+} {
+  return {
+    specifier: presetApiDiag.specifier,
+    resolvedPath: presetApiDiag.resolvedPath,
+    base: presetApiDiag.base,
+    errors: [...presetApiDiag.errors],
+  }
+}
+
+export function inventoryTraceForDebug(): unknown {  return inventoryTraceDiag()
 }
 
 /** P5（W3）：/debug/collect 先挂载后快照的挂载入口（无 control 闭包时 no-op）。 */
@@ -566,6 +586,18 @@ export function autoManageNeeded(master: boolean, byRoute: Readonly<Record<strin
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  // 0.7.0：解析 agent-presets 读取面（0.2.0 起旧包名被拆成 agent-preset +
+  // agent-preset-registry，静态 import 会在模块图加载期 ERR_MODULE_NOT_FOUND）。
+  // 必须 await 完成后再捕获 standing 挂载——`captureStandingMount` 只是记录句柄，
+  // 不解析模块，故两者顺序无关，但解析要先于任何 presetMounts() 读取。
+  void (async () => {
+    try {
+      await ensureAgentPresetApi(ctx)
+    } catch (error: unknown) {
+      ctx.logger.warn(`mcp-skill-panel: agent-presets 读取面解析失败: ${messageOf(error)}`)
+    }
+  })()
+
   // 启动早期加载 MCP 工具级禁用集合（memory Map，装配过滤同步读）。
   // 注意：加载是异步的，首个装配回合前禁用表可能未就绪（毫秒级窗口）；
   // 失败必须留日志（否则用户以为已禁用、实际全放行）。

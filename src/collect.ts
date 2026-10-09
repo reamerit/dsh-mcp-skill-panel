@@ -168,7 +168,11 @@ export async function resolveCollectScopeKey(ctx: Context, sessionId: string | u
     /* fall through */
   }
   try {
-    const key = await ctx.agentPresets.standingKeyFor()
+    // 0.7.0：`standingKeyFor()` 在 DSH 0.2.0-rc.2 被移除（改由 `acquireScope()`
+    // 返回带 dispose 的租约）。这是**可选加速路径**：拿不到就只少一条兜底，
+    // 由上面的 agent 分支 + 60s 快照路径覆盖，故按可选调用并显式降级。
+    const svc = ctx.agentPresets as unknown as { standingKeyFor?: () => Promise<unknown> }
+    const key = typeof svc.standingKeyFor === 'function' ? await svc.standingKeyFor() : undefined
     if (key !== undefined) {
       sharedScopeKey = key as object
       sharedScopeKeySource = 'standing'
@@ -490,7 +494,7 @@ async function collectMcp(deps: Deps, sessionId: string | undefined): Promise<Mc
     const presetId = agent ? (ctx.agentPresets.composedPreset(agent.ctx) ?? null) : null
     if (presetId) {
       try {
-        const { rows: presetRows } = await listPresetMcpRows(ctx, presetId)
+        const { rows: presetRows, presetKey } = await listPresetMcpRows(ctx, presetId, agent?.ctx)
         // 去重：loader 已有同 serverName 行（网关/官方/项目）时跳过 preset 快照。
         const liveServers = new Set(mcp.map((row) => row.serverName))
         for (const pr of presetRows) {
@@ -498,7 +502,8 @@ async function collectMcp(deps: Deps, sessionId: string | undefined): Promise<Mc
           const projectWorkspace = projectServerOwner(pr.serverName)
           const agg = byServer.get(pr.serverName)
           const liveTools = agg?.tools ?? 0
-          const rowDesired = state?.mcp?.[pr.file]?.[pr.rowId]?.desired
+          // 0.7.0：state 行来源键 = presetKey（0.2.0 起 preset 不落盘，键退化为 preset:<id>）。
+          const rowDesired = state?.mcp?.[presetKey]?.[pr.rowId]?.desired
           const pendingHit = pendingMcp.get(pr.entryId)
           // 从未操作过的预设行：无 pending、无 desired → pending=false（首屏不挂徽标）；
           // toggle 后（pendingHit 或 desired≠live）才挂 pending。

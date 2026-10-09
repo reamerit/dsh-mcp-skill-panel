@@ -13,6 +13,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { livePresetRows } from './preset-live'
 
 /** preset 文件文本解析出的单行 MCP 配置（key = 短 rowId，如 mcp-filesystem）。
  *
@@ -527,117 +528,309 @@ export async function findPresetRowByServerName(
   ctx: Context,
   presetId: string,
   serverName: string,
+  agentCtx?: Context,
 ): Promise<PresetMcpRow | undefined> {
-  const { rows } = await listPresetMcpRows(ctx, presetId)
+  // 严格版：未知 preset 仍抛（调用方 `.catch` 回退 undefined，与 cachedPresetRow 同语义）。
+  // 0.6.0 契约，selftest 有断言 —— 不要换成不抛的包装版。
+  const { rows } = await listPresetMcpRowsOrThrow(ctx, presetId, agentCtx)
   return rows.find((r) => r.serverName === serverName)
 }
 
 /**
- * 列出某 preset 在 standing 组合中的全部 MCP 行。
- * inventory 给 entryId/enabled/fiberState，preset 文本给 serverName/transport/超时。
+ * 列出某 preset 在 standing 组合中的全部 MCP 行（0.7.0 数据源迁移）。
+ *
+ * **数据源优先级**：
+ *   1. live standing 树（`livePresetRows`）—— 0.2.0 起唯一可用面：`resolve().path`
+ *      与 `read()` 都已不存在，desktop 的 preset 也不落盘。`entry.options.config`
+ *      是 loader 已求值的真值，比旧的正则解析 YAML 更准。
+ *   2. preset 文件文本（0.1.x 兼容面）：仅当 `resolve(id).path` 仍存在时才读，
+ *      用于补齐 live 树给不出的短 id/transport/超时（web profile 行为不变）。
+ *
+ * **不再 throw**：拿不到 preset（未挂载 / 不在 compositionInventory / 无文件）
+ * 时返回空表 + `presetKey`，由调用方决定怎么显示。0.6.0 的
+ * `throw preset "x" has no path` 会把整条 `/state` 打成 500、面板 MCP 页全空。
  */
 export async function listPresetMcpRows(
   ctx: Context,
   presetId: string,
+  agentCtx?: Context,
+): Promise<{ rows: PresetMcpRow[]; presetPath: string; presetKey: string }> {
+  try {
+    const out = await listPresetMcpRowsOrThrow(ctx, presetId, agentCtx)
+    return { ...out, presetKey: out.presetPath.length > 0 ? out.presetPath : presetKeyOf(presetId) }
+  } catch {
+    // preset 不可得（未挂载 / 不在 compositionInventory）：0.6.0 会在这里 throw，
+    // 把整条 `/state` 打成 500、面板 MCP 页全空。0.7.0 改为空表 + 稳定键，
+    // 由调用方按「该 preset 没有 MCP 行」渲染。unknown-preset 语义由
+    // `listPresetMcpRowsOrThrow` 保留（仍抛），只是本包装不再外传。
+    return { rows: [], presetPath: '', presetKey: presetKeyOf(presetId) }
+  }
+}
+
+/**
+ * 严格版：preset 不可得时**抛错**（"not in compositionInventory" / 文件面读不到文本）。
+ *
+ * 与 {@link listPresetMcpRows} 的分工：调用方需要区分「preset 不存在」与
+ * 「该 preset 恰好没有 MCP 行」时用本函数；面板批量渲染走包装版（不因一个
+ * 异常 preset 打空整页）。文件面行为与 0.6.0 逐字节一致，selftest 直接覆盖它。
+ */
+export async function listPresetMcpRowsOrThrow(
+  ctx: Context,
+  presetId: string,
+  agentCtx?: Context,
 ): Promise<{ rows: PresetMcpRow[]; presetPath: string }> {
   const presets = ctx.agentPresets as unknown as {
-    compositionInventory(): Promise<unknown>
-    resolve(id: string): Promise<unknown>
-    read(id: string): Promise<unknown>
+    compositionInventory?: () => Promise<unknown>
+    resolve?: (id: string) => Promise<unknown>
+    read?: (id: string) => Promise<unknown>
   }
-  const inventory = (await presets.compositionInventory()) as Array<{
-    id?: unknown
-    rows?: Array<{ entryId?: unknown; moduleName?: unknown; enabled?: unknown; fiberState?: unknown }>
-  }>
-  const found = (Array.isArray(inventory) ? inventory : []).find((c) => String(c?.id ?? '') === presetId)
-  if (!found) throw new Error(`preset "${presetId}" not in compositionInventory`)
-  const resolved = (await presets.resolve(presetId)) as { path?: unknown }
-  const presetPath = String(resolved?.path ?? '')
-  if (!presetPath) throw new Error(`preset "${presetId}" has no path`)
-  const text = String((await presets.read(presetId)) as unknown as string)
-  const parsed = parsePresetMcpText(text)
+
+  // ① live standing 树：0.2.0 起唯一可用面（resolve().path / read() 都已不存在）。
+  const live = livePresetRows(ctx, presetId, agentCtx)
+
+  // ② 文件面：仅当 resolve(id).path 仍存在（0.1.x / web profile）。
+  const inventory = await rawInventory(presets)
+  const found = inventory.find((c) => String(c?.id ?? '') === presetId)
+  if (live.length === 0 && !found) throw new Error(`preset "${presetId}" not in compositionInventory`)
+  const presetPath = await presetPathOf(presets, presetId)
+  // 旧行为硬约束：选中了 preset 却读不到文本 → 抛（不是静默空表）。
+  if (live.length === 0 && presetPath.length === 0) throw new Error(`preset "${presetId}" has no path`)
+
+  let parsed: Map<string, PresetMcpParsed> | undefined
+  if (presetPath.length > 0 && typeof presets.read === 'function') {
+    parsed = parsePresetMcpText(String((await presets.read(presetId)) as unknown as string))
+  }
+  // live 优先（0.2.0 数据源）；live 树不可得时回落纯文件面（0.1.x），
+  // 行 id 与顺序取自 compositionInventory，文本配置取自 preset 文件。
+  if (live.length > 0) return { rows: livePresetRowsToRows(live, parsed, presetPath), presetPath }
   const rows: PresetMcpRow[] = []
-  for (const r of found.rows ?? []) {
-    if (String(r?.moduleName ?? '') !== '@deepseek-ai/dsh-mcp-client') continue
-    const entryId = String(r?.entryId ?? '')
-    if (!entryId) continue
-    const rowId = entryId.split(':').pop() ?? entryId
-    const info = parsed.get(rowId)
-    const serverName = info?.serverName ?? fallbackServerName(rowId)
-    // inventory enabled 恒为 boolean（mcp 行 disabled 无 !!js）；缺席/非 false 保守按启用处理
-    const disabled = (r as { enabled?: unknown })?.enabled === false
-    // fiberState：inventory 只在 fiber 存在时带该键；判 running 用 != null（防 null/0 误判）
-    const fiberState = (r as { fiberState?: unknown })?.fiberState
-    const running = fiberState !== undefined && fiberState !== null
-    // NIT-3：config 不可挂载（undefined）时不留键，避免显式 config: undefined
-    const mountConfig = info ? presetConfigOf(info) : undefined
+  for (const r of await inventoryRows(presets, presetId)) {
+    const rowId = r.entryId.split(':').pop() ?? r.entryId
+    const info = parsed?.get(rowId)
+    const config = info ? presetConfigOf(info) : undefined
     rows.push({
-      entryId,
+      entryId: r.entryId,
       rowId,
-      serverName,
+      serverName: info?.serverName ?? fallbackServerName(rowId),
       transport: info?.transport ?? null,
-      toolCallTimeoutMs: info?.toolCallTimeoutMs,
-      disabled,
-      running,
+      ...(info?.toolCallTimeoutMs !== undefined ? { toolCallTimeoutMs: info.toolCallTimeoutMs } : {}),
+      disabled: r.enabled === false,
+      running: r.fiberState !== undefined && r.fiberState !== null,
       file: presetPath,
-      ...(mountConfig ? { config: mountConfig } : {}),
+      ...(config ? { config } : {}),
     })
   }
   return { rows, presetPath }
 }
 
 /**
+ * live 行 → 面板行（**导出以便 selftest 直接覆盖 0.2.0 数据源**）。
+ *
+ * 这是 0.7.0 的核心映射：`entry.options.config` 直接就是挂载配置（loader 已求值），
+ * 不再经「读 preset 文件文本 + 正则解析 + 自行求值 `!!js`」那条 0.2.0 已删除的链路。
+ *
+ * ⚠️ 入参用**结构化类型**而非 `preset-live.ts` 的 `LivePresetRow`：一旦引入那个
+ * 具名类型，本模块就与 `preset-live` → `standing-rows` → 宿主包链上关系，
+ * 而本模块要作为**零宿主依赖独立产物**（`lib/preset-text.js`）被 selftest 直接加载。
+ * @param live - live 树行（结构兼容 `preset-live.ts` 的产出）。
+ * @param parsed - 可选的文件面解析结果（仅用于补齐 live config 给不出的字段）。
+ * @param presetPath - 组合文件路径（0.2.0 起恒为 ''）。
+ * @returns 面板行。
+ */
+export function livePresetRowsToRows(
+  live: ReadonlyArray<{
+    entryId: string
+    rowId: string
+    config?: PresetMcpClientConfig
+    disabled: boolean
+    running: boolean
+  }>,
+  parsed: Map<string, PresetMcpParsed> | undefined,
+  presetPath: string,
+): PresetMcpRow[] {
+  const rows: PresetMcpRow[] = []
+  for (const row of live) {
+    const info = parsed?.get(row.rowId)
+    const config = row.config ?? (info ? presetConfigOf(info) : undefined)
+    rows.push({
+      entryId: row.entryId,
+      rowId: row.rowId,
+      serverName: config?.serverName ?? info?.serverName ?? fallbackServerName(row.rowId),
+      transport: config?.transport ?? info?.transport ?? null,
+      ...(config?.toolCallTimeoutMs !== undefined
+        ? { toolCallTimeoutMs: config.toolCallTimeoutMs }
+        : info?.toolCallTimeoutMs !== undefined
+          ? { toolCallTimeoutMs: info.toolCallTimeoutMs }
+          : {}),
+      disabled: row.disabled,
+      running: row.running,
+      file: presetPath,
+      ...(config ? { config } : {}),
+    })
+  }
+  return rows
+}
+
+/**
+ * state.json `mcp` 段的行来源键。
+ *
+ * 0.2.0 起 preset 不再有文件路径（`AgentPreset` 无 `path`、`read()` 已删、
+ * desktop 的 preset 内联在 `cordis.yml`），故键退化为 preset id。语义未变：
+ * 该键只回答「这份行集属于哪个来源」，插件本就是「一个 preset 一棵树」的模型。
+ * @param presetId - preset id。
+ * @returns `preset:<id>` 形态的稳定键。
+ */
+export function presetKeyOf(presetId: string): string {
+  return `preset:${presetId}`
+}
+
+/** compositionInventory 里某 preset 的 MCP 行（entryId/enabled/fiberState 快照）。 */
+async function inventoryRows(
+  presets: { compositionInventory?: () => Promise<unknown> },
+  presetId: string,
+): Promise<Array<{ entryId: string; enabled?: unknown; fiberState?: unknown }>> {
+  let inventory: unknown
+  try {
+    inventory = await presets.compositionInventory?.()
+  } catch {
+    return []
+  }
+  const found = (Array.isArray(inventory) ? inventory : []).find(
+    (c) => String((c as { id?: unknown })?.id ?? '') === presetId,
+  ) as { rows?: Array<{ entryId?: unknown; moduleName?: unknown; enabled?: unknown; fiberState?: unknown }> } | undefined
+  const out: Array<{ entryId: string; enabled?: unknown; fiberState?: unknown }> = []
+  for (const r of found?.rows ?? []) {
+    if (String(r?.moduleName ?? '') !== '@deepseek-ai/dsh-mcp-client') continue
+    const entryId = String(r?.entryId ?? '')
+    if (!entryId) continue
+    out.push({ entryId, ...(r?.enabled !== undefined ? { enabled: r.enabled } : {}), ...(r?.fiberState !== undefined ? { fiberState: r.fiberState } : {}) })
+  }
+  return out
+}
+
+/**
  * 按长 entryId 反查其所属 preset 行（toggleMcp 预设兜底用）。
- * 逐 preset 找 entryId 命中，找到即 resolve+read+parse 该 preset。
+ *
+ * 0.7.0：优先在 live standing 树里直接命中该 entryId —— 句柄本身就是行，
+ * 不必再经 inventory + `read()` + 正则；只有 live 树不可得时才回落
+ * 「逐 preset 扫 compositionInventory + 读 preset 文件」的旧路径。
  */
 export async function findPresetRowByEntryId(
   ctx: Context,
   entryId: string,
-): Promise<{ presetId: string; row: PresetMcpRow; presetPath: string } | undefined> {
+  agentCtx?: Context,
+): Promise<{ presetId: string; row: PresetMcpRow; presetPath: string; presetKey: string } | undefined> {
   const presets = ctx.agentPresets as unknown as {
-    compositionInventory(): Promise<unknown>
-    resolve(id: string): Promise<unknown>
-    read(id: string): Promise<unknown>
+    compositionInventory?: () => Promise<unknown>
+    resolve?: (id: string) => Promise<unknown>
+    read?: (id: string) => Promise<unknown>
   }
-  const inventory = (await presets.compositionInventory()) as Array<{
-    id?: unknown
-    rows?: Array<{ entryId?: unknown; moduleName?: unknown; enabled?: unknown; fiberState?: unknown }>
-  }>
-  for (const c of Array.isArray(inventory) ? inventory : []) {
+
+  // ① live 树：先问当前组合的 preset，再遍历全部 standing 挂载（多 preset 场景）。
+  const candidatePresetIds = [await composedPresetId(ctx, agentCtx), ...(await inventoryPresetIds(presets))]
+  for (const pid of candidatePresetIds) {
+    if (!pid) continue
+    const hit = livePresetRows(ctx, pid, agentCtx).find((r) => r.entryId === entryId)
+    if (!hit) continue
+    const presetPath = await presetPathOf(presets, pid)
+    const config = hit.config
+    return {
+      presetId: pid,
+      presetPath,
+      presetKey: presetPath.length > 0 ? presetPath : presetKeyOf(pid),
+      row: {
+        entryId: hit.entryId,
+        rowId: hit.rowId,
+        serverName: config?.serverName ?? fallbackServerName(hit.rowId),
+        transport: config?.transport ?? null,
+        ...(config?.toolCallTimeoutMs !== undefined ? { toolCallTimeoutMs: config.toolCallTimeoutMs } : {}),
+        disabled: hit.disabled,
+        running: hit.running,
+        file: presetPath,
+        ...(config ? { config } : {}),
+      },
+    }
+  }
+
+  // ② 回落：compositionInventory + preset 文件（0.2.0 之前的行为）。
+  const inventory = await rawInventory(presets)
+  for (const c of inventory) {
     const pid = String(c?.id ?? '')
     if (!pid) continue
     const hit = (c.rows ?? []).find(
       (r) => String(r?.entryId ?? '') === entryId && String(r?.moduleName ?? '') === '@deepseek-ai/dsh-mcp-client',
     )
     if (!hit) continue
-    const resolved = (await presets.resolve(pid)) as { path?: unknown }
-    const presetPath = String(resolved?.path ?? '')
+    const presetPath = await presetPathOf(presets, pid)
     if (!presetPath) continue
-    const text = String((await presets.read(pid)) as unknown as string)
-    const parsed = parsePresetMcpText(text)
+    let parsed: Map<string, PresetMcpParsed>
+    try {
+      parsed = parsePresetMcpText(String((await presets.read?.(pid)) as unknown as string))
+    } catch {
+      continue
+    }
     const rowId = entryId.split(':').pop() ?? entryId
     const info = parsed.get(rowId)
-    const serverName = info?.serverName ?? fallbackServerName(rowId)
-    const disabled = (hit as { enabled?: unknown })?.enabled === false
-    const hitFiber = (hit as { fiberState?: unknown })?.fiberState
-    const running = hitFiber !== undefined && hitFiber !== null
-    // NIT-3：config 不可挂载（undefined）时不留键
     const mountConfig = info ? presetConfigOf(info) : undefined
+    const fiberState = (hit as { fiberState?: unknown })?.fiberState
     return {
       presetId: pid,
       presetPath,
+      presetKey: presetPath.length > 0 ? presetPath : presetKeyOf(pid),
       row: {
         entryId,
         rowId,
-        serverName,
+        serverName: info?.serverName ?? fallbackServerName(rowId),
         transport: info?.transport ?? null,
-        toolCallTimeoutMs: info?.toolCallTimeoutMs,
-        disabled,
-        running,
+        ...(info?.toolCallTimeoutMs !== undefined ? { toolCallTimeoutMs: info.toolCallTimeoutMs } : {}),
+        disabled: (hit as { enabled?: unknown })?.enabled === false,
+        running: fiberState !== undefined && fiberState !== null,
         file: presetPath,
         ...(mountConfig ? { config: mountConfig } : {}),
       },
     }
   }
   return undefined
+}
+
+/** 当前会话组合的 preset id（拿不到返回 ''）。 */
+async function composedPresetId(ctx: Context, agentCtx?: Context): Promise<string> {
+  if (agentCtx === undefined) return ''
+  try {
+    return ctx.agentPresets.composedPreset(agentCtx) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** compositionInventory 的原始条目（失败返回空表）。 */
+type RawInventoryRow = { entryId?: unknown; moduleName?: unknown; enabled?: unknown; fiberState?: unknown }
+type RawInventoryEntry = { id?: unknown; rows?: RawInventoryRow[] }
+
+async function rawInventory(
+  presets: { compositionInventory?: () => Promise<unknown> },
+): Promise<RawInventoryEntry[]> {
+  try {
+    const inventory = await presets.compositionInventory?.()
+    return Array.isArray(inventory) ? (inventory as RawInventoryEntry[]) : []
+  } catch {
+    return []
+  }
+}
+
+/** compositionInventory 里的全部 preset id。 */
+async function inventoryPresetIds(presets: { compositionInventory?: () => Promise<unknown> }): Promise<string[]> {
+  const inventory = await rawInventory(presets)
+  return inventory.map((c) => String(c?.id ?? '')).filter((id) => id.length > 0)
+}
+
+/** 某 preset 的组合文件绝对路径（0.2.0 起不存在，返回 ''）。 */
+async function presetPathOf(presets: { resolve?: (id: string) => Promise<unknown> }, presetId: string): Promise<string> {
+  try {
+    const resolved = (await presets.resolve?.(presetId)) as { path?: unknown } | undefined
+    const path = resolved?.path
+    return typeof path === 'string' ? path : ''
+  } catch {
+    return ''
+  }
 }

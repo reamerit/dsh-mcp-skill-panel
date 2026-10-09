@@ -13,29 +13,33 @@ import { homedir } from 'node:os'
 import { readState, writeState, stateApplyMode, stateAutoManageByRoute, stateMiddleLayerHides, stateToolBudget, type ApplyMode } from './state'
 import { setSkillFlag, rowDisabledState, isValidSkillName, buildSkillMd, EDITABLE_CONFIG_KEYS } from './preset'
 import { pendingMcp, applyPendingMcp } from './pending'
-import { findPresetRowByEntryId, findPresetRowByServerName } from './preset-mcp'
+import { findPresetRowByEntryId, findPresetRowByServerName, presetKeyOf, listPresetMcpRows } from './preset-mcp'
 import { gatewayServerOfEntryId } from './gateway'
 
 /**
  * B4：网关行 serverName → 当前会话 preset 行定位（entryId 映射不到 preset entryId，
  * 按 serverName 精确匹配；presetId 取当前会话 composedPreset，无会话返回 undefined）。
+ *
+ * 0.7.0：`presetKey` 取代 `presetPath` 作为 state.json 的行来源键（0.2.0 起 preset
+ * 不再有文件路径）；同时把 agent ctx 透传给行源，让 live 树能经
+ * `standingMountFor(agentCtx)` 兜底取挂载。
  */
 async function findPresetRowByServerNameLike(ctx: Context, serverName: string) {
   try {
-    const { resolveAgent } = await import('./collect')
     const agent = resolveAgent(ctx, undefined)
     const presetId = agent ? (ctx.agentPresets.composedPreset(agent.ctx) ?? null) : null
     if (!presetId) return undefined
-    const row = await findPresetRowByServerName(ctx, presetId, serverName)
+    const row = await findPresetRowByServerName(ctx, presetId, serverName, agent?.ctx)
     if (!row) return undefined
-    return { presetId, row, presetPath: row.file }
+    const listed = await listPresetMcpRows(ctx, presetId, agent?.ctx)
+    return { presetId, row, presetPath: row.file, presetKey: listed.presetKey }
   } catch {
     return undefined
   }
 }
 import { resolveAgent, resolveCollectScopeKey, scopeKeySource, getSchemasView, mergeSchemas, collectMcp, collectSkills, confirmedSkills, pruneExpired, DOMAIN_TTL_MS, SKILL_TOGGLE_POLL_MS, type DomainCaches, type Deps } from './collect'
 import { isMcpEntry, serverNameOf } from './mcp-entry'
-import { findStandingEntryById, standingDiag, standingMcpEntries, findStandingEntryByServer } from './standing-rows'
+import { findStandingEntryById, standingDiag, standingMcpEntries, findStandingEntryByServer, presetIdOfEntry } from './standing-rows'
 import { parseMcpServersJson, serversToPatchYaml, serversToRows, type McpServers, type McpRowConfig } from './mcp-convert'
 import { remountWorkspace, projectServerOwner, getActiveWorkspace } from './project-mcp'
 import { disabledToolsOf, setToolDisabled, setToolsDisabledBulk, resolveToolBulkTargets } from './tool-disable'
@@ -209,22 +213,33 @@ async function toggleMcp(deps: Deps, entryId: string, disabled: boolean, applyMo
     if (found) {
       const state = await readState()
       state.mcp ??= {}
-      state.mcp[found.presetPath] ??= {}
-      // lastApplied 与 live 路径一致取文件实际状态（preset.ts:rowDisabledState），
-      // 读不到文件才回落 inventory 值（防 standing/文件漂移误判外部修改）。
+      // 0.7.0：行来源键 = presetKey（presetPath 存在时就是它，否则 `preset:<id>`）。
+      const sourceKey = found.presetKey
+      state.mcp[sourceKey] ??= {}
+      // lastApplied 与 live 路径一致取文件实际状态（preset.ts:rowDisabledState）；
+      // **0.2.0 起 preset 不再落盘**，读不到文件时按 live 树事实（found.row.disabled）
+      // 记 lastApplied —— 该值同时是「外部改动」判据，live 事实是此时唯一可得真值。
       let fileState: boolean | null = found.row.disabled
-      try {
-        const { rowDisabledState } = await import('./preset')
-        fileState = rowDisabledState(await readFile(found.presetPath, 'utf8'), found.row.rowId)
-      } catch {
-        fileState = found.row.disabled
+      if (found.presetPath.length > 0) {
+        try {
+          const { rowDisabledState } = await import('./preset')
+          fileState = rowDisabledState(await readFile(found.presetPath, 'utf8'), found.row.rowId)
+        } catch {
+          fileState = found.row.disabled
+        }
       }
-      state.mcp[found.presetPath][found.row.rowId] = { desired: disabled, lastApplied: fileState }
+      state.mcp[sourceKey][found.row.rowId] = { desired: disabled, lastApplied: fileState }
       await writeState(state)
       // 内存队列同样记录（pending 徽标 + 下次边界 applyPendingMcp 尝试 entry.update，
       // 行仍不可 resolve 时保留队列，见 pending.ts:50-53 行失效语义——此处反向：
       // 找不到才保留意图；若将来行回到 loader，边界可正常应用）。
-      pendingMcp.set(entryId, { entryId, file: found.presetPath, rowId: found.row.rowId, disabled })
+      pendingMcp.set(entryId, {
+        entryId,
+        file: found.presetPath.length > 0 ? found.presetPath : null,
+        rowId: found.row.rowId,
+        disabled,
+        sourceKey,
+      })
       if (!disabled && deps.controller) {
         deps.controller.markUserEnabled(found.row.serverName)
       }
@@ -237,6 +252,7 @@ async function toggleMcp(deps: Deps, entryId: string, disabled: boolean, applyMo
         running: found.row.running,
         persisted: true,
         file: found.presetPath,
+        sourceKey,
         applied: false,
         pending: true,
         // 网关行面板口径与 collect 一致（NIT-4）：collect 标 'gateway'，此处回 'gateway'。
@@ -280,29 +296,45 @@ async function toggleMcp(deps: Deps, entryId: string, disabled: boolean, applyMo
       pending: false,
     }
   }
+  // 0.7.0：行来源键。有预设文件时它就是文件路径（0.1.x 行为不变）；
+  // **0.2.0 起 preset 不再落盘**（resolve().path 没了、desktop 的 preset 内联在
+  // cordis.yml），此时退化为 `preset:<id>`，live 树成为唯一真值来源。
+  const presetFile = (entry.parent?.tree as { filename?: string } | undefined)?.filename
+  const presetId = presetFile ? '' : presetIdOfEntry(entry)
+  const sourceKey = typeof presetFile === 'string' && presetFile.length > 0 ? presetFile : presetId.length > 0 ? presetKeyOf(presetId) : ''
+  /** live 行的事实停用态（`entry.disabled` 已求值；文件不可得时的 lastApplied 真值）。 */
+  const liveDisabled = entry.disabled === true
   // P1 会话边界生效（v0.5.0）：next-session 模式只记意图（进入待生效队列），
   // 不立即 entry.update —— 运行时 tools 前缀不变 → 当前会话零缓存失效、零费用。
   // 生效时机：新会话 agent/session-start 首次请求前 applyPendingMcp，或重启后
   // syncPresetFiles 物化预设。immediate（默认）保持原行为：下轮即生效（会 miss）。
   const deferred = mode === 'next-session'
   if (deferred) {
-    pendingMcp.set(entryId, { entryId, file: (entry.parent?.tree as { filename?: string } | undefined)?.filename ?? null, rowId, disabled })
+    pendingMcp.set(entryId, {
+      entryId,
+      file: typeof presetFile === 'string' && presetFile.length > 0 ? presetFile : null,
+      rowId,
+      disabled,
+      sourceKey: sourceKey.length > 0 ? sourceKey : null,
+    })
     // 0.6.0：意图必须**同时落盘**。原实现只进内存队列，于是"记了意图但没开新会话就重启"
     // 的用户设置会静默丢失（applyStateResidue 的 desired 兜底因此也永远无输入）。
     // 与 preset 兜底分支（本文件 :184-185）语义对齐：desired=用户意图，lastApplied=文件现值。
-    const presetFile = (entry.parent?.tree as { filename?: string } | undefined)?.filename
-    if (typeof presetFile === 'string' && presetFile.length > 0) {
+    if (sourceKey.length > 0) {
       try {
         const st = await readState()
         st.mcp ??= {}
-        st.mcp[presetFile] ??= {}
-        let fileState: boolean | null = null
-        try {
-          fileState = rowDisabledState(await readFile(presetFile, 'utf8'), rowId)
-        } catch {
-          fileState = null
+        st.mcp[sourceKey] ??= {}
+        // lastApplied 取文件事实（可得时），否则取 live 事实（0.2.0 唯一可得真值）。
+        let fileState: boolean | null = liveDisabled
+        if (typeof presetFile === 'string' && presetFile.length > 0) {
+          try {
+            fileState = rowDisabledState(await readFile(presetFile, 'utf8'), rowId)
+          } catch {
+            fileState = liveDisabled
+          }
         }
-        st.mcp[presetFile][rowId] = { desired: disabled, lastApplied: fileState }
+        st.mcp[sourceKey][rowId] = { desired: disabled, lastApplied: fileState }
         await writeState(st)
       } catch (error) {
         ctx.logger.warn?.(`mcp-skill-panel: persist pending intent for "${entryId}" failed: ${messageOf(error)}`)
@@ -342,22 +374,25 @@ async function toggleMcp(deps: Deps, entryId: string, disabled: boolean, applyMo
   }
   // 持久化：v0.1.1 起运行期绝不写预设文件（触发 dsh-agent-presets stamp 重挂事故）。
   // 只把意图写入插件状态文件，由下次启动的 syncPresetFiles() 物化到预设文件。
-  const tree = entry.parent?.tree as { filename?: string } | undefined
-  const file = tree?.filename
-  let fileState: boolean | null = null
-  if (typeof file === 'string' && file.length > 0) {
-    try {
-      fileState = rowDisabledState(await readFile(file, 'utf8'), rowId)
-    } catch {
-      fileState = null
-    }
-  }
+  // 0.7.0：0.2.0 起 preset 不落盘，syncPresetFiles 对该键是 no-op（读不到文件即跳过），
+  // 持久化由 live 树自身承担（standing 行的 entry.update 就是真持久化）。
   let persisted = false
-  if (typeof file === 'string' && file.length > 0) {
+  if (sourceKey.length > 0) {
+    // lastApplied 取「本次改动前」的事实：有文件取文件、否则取 live（0.2.0 唯一真值）。
+    // 与 preset 兜底分支同语义（desired=用户意图，lastApplied=改动前现状），
+    // 供 syncPresetFiles 判「文件是否被外部改过」。
+    let liveFileState: boolean | null = liveDisabled
+    if (typeof presetFile === 'string' && presetFile.length > 0) {
+      try {
+        liveFileState = rowDisabledState(await readFile(presetFile, 'utf8'), rowId)
+      } catch {
+        liveFileState = liveDisabled
+      }
+    }
     const state = await readState()
     state.mcp ??= {}
-    state.mcp[file] ??= {}
-    state.mcp[file][rowId] = { desired: disabled, lastApplied: fileState }
+    state.mcp[sourceKey] ??= {}
+    state.mcp[sourceKey][rowId] = { desired: disabled, lastApplied: liveFileState }
     await writeState(state)
     persisted = true
   }
@@ -368,7 +403,8 @@ async function toggleMcp(deps: Deps, entryId: string, disabled: boolean, applyMo
     disabled,
     running: entry.fiber !== undefined,
     persisted,
-    file: file ?? null,
+    file: typeof presetFile === 'string' && presetFile.length > 0 ? presetFile : null,
+    sourceKey: sourceKey.length > 0 ? sourceKey : null,
     applied: !deferred,
     pending: deferred,
   }

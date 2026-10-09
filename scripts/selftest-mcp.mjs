@@ -886,6 +886,101 @@ check('findPresetRowByServerName 经构建产物导出（index 转出）', () =>
   assert.equal(typeof index.findPresetRowByServerName, 'function')
 })
 
+// ── 0.7.0 数据源迁移：DSH 0.2.0 删掉了 preset 文件面（resolve().path / read()）──
+// 故障现场（2026-10 实测）：0.2.0-rc.2 的 `@deepseek-ai/dsh-agent-presets` 被拆成
+// agent-preset + agent-preset-registry，旧包名不存在；且 AgentPreset 无 path、
+// read() 已删。0.6.0 的 listPresetMcpRows 会直接 `throw preset "..." has no path`
+// → /state 500 → 面板 MCP 页全空。下列断言就是这条链路的回归护栏。
+const presetText = await import(pathToFileURL(join(root, 'lib', 'preset-text.js')).href)
+
+check('0.2.0 数据源：live 树行 → 面板行（entry.options.config 即挂载配置，无需读文件）', () => {
+  const live = [
+    {
+      entryId: 'include:agent-presets:mcp-filesystem',
+      rowId: 'mcp-filesystem',
+      disabled: false,
+      running: true,
+      config: {
+        serverName: 'filesystem',
+        transport: 'stdio',
+        command: 'npx',
+        args: ['-y', '@modelcontextprotocol/server-filesystem', 'C:\\projects\\demo'],
+        env: { TOKEN: 'evaluated-secret' },
+        toolCallTimeoutMs: 60000,
+      },
+    },
+    {
+      entryId: 'include:agent-presets:mcp-exa',
+      rowId: 'mcp-exa',
+      disabled: true,
+      running: false,
+      config: { serverName: 'exa', transport: 'streamable-http', url: 'https://exa.example/mcp' },
+    },
+    // 不可挂载行（缺 command 的 stdio）：无 config，serverName 只靠短 id 回落
+    { entryId: 'include:agent-presets:mcp-anki', rowId: 'mcp-anki', disabled: true, running: false },
+    // 非 MCP 行不该出现在这里（由 preset-live 过滤），这里只验映射的健壮性
+  ]
+  const rows = presetText.livePresetRowsToRows(live, undefined, '')
+  assert.equal(rows.length, 3)
+  // 行 1：全量配置来自 live config（含 !!js 求值后的 env 真值）
+  assert.deepEqual(rows[0], {
+    entryId: 'include:agent-presets:mcp-filesystem',
+    rowId: 'mcp-filesystem',
+    serverName: 'filesystem',
+    transport: 'stdio',
+    toolCallTimeoutMs: 60000,
+    disabled: false,
+    running: true,
+    file: '',
+    config: {
+      serverName: 'filesystem',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', 'C:\\projects\\demo'],
+      env: { TOKEN: 'evaluated-secret' },
+      toolCallTimeoutMs: 60000,
+    },
+  })
+  // 行 2：streamable-http 形态
+  assert.equal(rows[1].transport, 'streamable-http')
+  assert.equal(rows[1].disabled, true)
+  assert.equal(rows[1].config.url, 'https://exa.example/mcp')
+  // 行 3：无 config 时 serverName 按 fallbackServerName 回落（mcp-anki → anki-mcp）
+  assert.equal(rows[2].serverName, 'anki-mcp')
+  assert.equal(rows[2].config, undefined)
+  assert.equal(rows[2].transport, null)
+  // 0.2.0 起 preset 没有文件路径 → file 必须是空串（state.json 键改走 presetKey）
+  assert.equal(rows[2].file, '')
+})
+
+check('0.2.0 数据源：presetKey 取代文件路径作为 state.json 行来源键', () => {
+  assert.equal(presetText.presetKeyOf('standard'), 'preset:standard')
+  // 有文件路径时键仍是文件路径（0.1.x 行为逐字节不变）—— 由 listPresetMcpRows 决定，
+  // 这里只锁 presetKeyOf 的形态，避免将来有人把前缀改掉导致旧 state.json 全失效。
+  assert.equal(presetText.presetKeyOf(''), 'preset:')
+})
+
+check('0.2.0 数据源：live config 优先于文件面解析结果（两者并存时不互相污染）', () => {
+  const live = [
+    {
+      entryId: 'include:agent-presets:mcp-exa',
+      rowId: 'mcp-exa',
+      disabled: false,
+      running: true,
+      config: { serverName: 'exa-live', transport: 'streamable-http', url: 'https://live.example/mcp' },
+    },
+  ]
+  // 文件面给出的是**旧**文本（serverName 不同）→ live 必须赢
+  const parsed = index.parsePresetMcpText(
+    ['- id: mcp-exa', "  name: '@deepseek-ai/dsh-mcp-client'", '  config:', '    serverName: exa-stale', '    transport: streamable-http', '    url: https://stale.example/mcp'].join('\n'),
+  )
+  const rows = presetText.livePresetRowsToRows(live, parsed, '/preset/agent.cordis.yml')
+  assert.equal(rows[0].serverName, 'exa-live')
+  assert.equal(rows[0].config.url, 'https://live.example/mcp')
+  // 文件路径仍作为 file 回显（有文件时键就是它）
+  assert.equal(rows[0].file, '/preset/agent.cordis.yml')
+})
+
 // ── P1 直读：parsePresetMcpText 全键抓取（command/args/env/cwd/url/headers/failOnStartupError） ──
 // BLOCK-1 回归：flow 单行 args（实块 6 行 stdio 形态）必须解析，弃测即漏保真断裂
 check('parsePresetMcpText：P1 直读 flow 单行 args（calcmcp 实块形态）', () => {

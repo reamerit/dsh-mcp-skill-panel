@@ -85,21 +85,78 @@ export declare function presetConfigOf(parsed: PresetMcpParsed): PresetMcpClient
  * preset 文本缺 serverName 键时按 fallbackServerName 回落（与 listPresetMcpRows
  * 同规则，覆盖 mcp-anki→anki-mcp 例外）。若重复取首行（上游保证唯一）。
  */
-export declare function findPresetRowByServerName(ctx: Context, presetId: string, serverName: string): Promise<PresetMcpRow | undefined>;
+export declare function findPresetRowByServerName(ctx: Context, presetId: string, serverName: string, agentCtx?: Context): Promise<PresetMcpRow | undefined>;
 /**
- * 列出某 preset 在 standing 组合中的全部 MCP 行。
- * inventory 给 entryId/enabled/fiberState，preset 文本给 serverName/transport/超时。
+ * 列出某 preset 在 standing 组合中的全部 MCP 行（0.7.0 数据源迁移）。
+ *
+ * **数据源优先级**：
+ *   1. live standing 树（`livePresetRows`）—— 0.2.0 起唯一可用面：`resolve().path`
+ *      与 `read()` 都已不存在，desktop 的 preset 也不落盘。`entry.options.config`
+ *      是 loader 已求值的真值，比旧的正则解析 YAML 更准。
+ *   2. preset 文件文本（0.1.x 兼容面）：仅当 `resolve(id).path` 仍存在时才读，
+ *      用于补齐 live 树给不出的短 id/transport/超时（web profile 行为不变）。
+ *
+ * **不再 throw**：拿不到 preset（未挂载 / 不在 compositionInventory / 无文件）
+ * 时返回空表 + `presetKey`，由调用方决定怎么显示。0.6.0 的
+ * `throw preset "x" has no path` 会把整条 `/state` 打成 500、面板 MCP 页全空。
  */
-export declare function listPresetMcpRows(ctx: Context, presetId: string): Promise<{
+export declare function listPresetMcpRows(ctx: Context, presetId: string, agentCtx?: Context): Promise<{
+    rows: PresetMcpRow[];
+    presetPath: string;
+    presetKey: string;
+}>;
+/**
+ * 严格版：preset 不可得时**抛错**（"not in compositionInventory" / 文件面读不到文本）。
+ *
+ * 与 {@link listPresetMcpRows} 的分工：调用方需要区分「preset 不存在」与
+ * 「该 preset 恰好没有 MCP 行」时用本函数；面板批量渲染走包装版（不因一个
+ * 异常 preset 打空整页）。文件面行为与 0.6.0 逐字节一致，selftest 直接覆盖它。
+ */
+export declare function listPresetMcpRowsOrThrow(ctx: Context, presetId: string, agentCtx?: Context): Promise<{
     rows: PresetMcpRow[];
     presetPath: string;
 }>;
 /**
- * 按长 entryId 反查其所属 preset 行（toggleMcp 预设兜底用）。
- * 逐 preset 找 entryId 命中，找到即 resolve+read+parse 该 preset。
+ * live 行 → 面板行（**导出以便 selftest 直接覆盖 0.2.0 数据源**）。
+ *
+ * 这是 0.7.0 的核心映射：`entry.options.config` 直接就是挂载配置（loader 已求值），
+ * 不再经「读 preset 文件文本 + 正则解析 + 自行求值 `!!js`」那条 0.2.0 已删除的链路。
+ *
+ * ⚠️ 入参用**结构化类型**而非 `preset-live.ts` 的 `LivePresetRow`：一旦引入那个
+ * 具名类型，本模块就与 `preset-live` → `standing-rows` → 宿主包链上关系，
+ * 而本模块要作为**零宿主依赖独立产物**（`lib/preset-text.js`）被 selftest 直接加载。
+ * @param live - live 树行（结构兼容 `preset-live.ts` 的产出）。
+ * @param parsed - 可选的文件面解析结果（仅用于补齐 live config 给不出的字段）。
+ * @param presetPath - 组合文件路径（0.2.0 起恒为 ''）。
+ * @returns 面板行。
  */
-export declare function findPresetRowByEntryId(ctx: Context, entryId: string): Promise<{
+export declare function livePresetRowsToRows(live: ReadonlyArray<{
+    entryId: string;
+    rowId: string;
+    config?: PresetMcpClientConfig;
+    disabled: boolean;
+    running: boolean;
+}>, parsed: Map<string, PresetMcpParsed> | undefined, presetPath: string): PresetMcpRow[];
+/**
+ * state.json `mcp` 段的行来源键。
+ *
+ * 0.2.0 起 preset 不再有文件路径（`AgentPreset` 无 `path`、`read()` 已删、
+ * desktop 的 preset 内联在 `cordis.yml`），故键退化为 preset id。语义未变：
+ * 该键只回答「这份行集属于哪个来源」，插件本就是「一个 preset 一棵树」的模型。
+ * @param presetId - preset id。
+ * @returns `preset:<id>` 形态的稳定键。
+ */
+export declare function presetKeyOf(presetId: string): string;
+/**
+ * 按长 entryId 反查其所属 preset 行（toggleMcp 预设兜底用）。
+ *
+ * 0.7.0：优先在 live standing 树里直接命中该 entryId —— 句柄本身就是行，
+ * 不必再经 inventory + `read()` + 正则；只有 live 树不可得时才回落
+ * 「逐 preset 扫 compositionInventory + 读 preset 文件」的旧路径。
+ */
+export declare function findPresetRowByEntryId(ctx: Context, entryId: string, agentCtx?: Context): Promise<{
     presetId: string;
     row: PresetMcpRow;
     presetPath: string;
+    presetKey: string;
 } | undefined>;

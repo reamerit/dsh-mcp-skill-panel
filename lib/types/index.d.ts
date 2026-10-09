@@ -59,6 +59,18 @@ export declare function controllerStatusForDebug(): {
     }>;
 };
 /** 0.6.3：能力表采集的逐阶段痕迹（/debug 的 inventoryTrace）。 */
+/**
+ * agent-presets 模块解析诊断（selftest / 装机排障；不参与任何逻辑判断）。
+ *
+ * 回答「本插件解析到的是哪一份实例」——`livePresetMounts()` 的挂载表是包内
+ * **模块私有** Set，解析错实例的后果是静默空表（面板 MCP 行全空），不是报错。
+ */
+export declare function agentPresetApiForDebug(): {
+    specifier: string | null;
+    resolvedPath: string | null;
+    base: string;
+    errors: string[];
+};
 export declare function inventoryTraceForDebug(): unknown;
 export declare function ensureOpenMountsForDebug(): Promise<unknown>;
 export { readState, writeState, stateAutoManageByRoute, stateMiddleLayerHides, stateToolBudget } from './state';

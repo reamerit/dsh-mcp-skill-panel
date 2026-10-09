@@ -132,12 +132,15 @@ flowchart TD
 ## 📦 安装
 
 ```sh
-dsh plugin --profile web add "github:lilyblessing/dsh-mcp-skill-panel#main"
+dsh plugin --profile web add "github:reamerit/dsh-mcp-skill-panel#main"
 ```
+
+> 桌面端：**不要**用 `dsh plugin --profile desktop add`（Desktop 2.x 明确禁止该通道），
+> 请在「设置 → 插件」或 dshmarket 里安装。
 
 产物已入库（`lib/`），git 源一行安装，无需构建授权。安装后**重启 `dsh web`**（bundle 层在启动时合成，热更新无效），设置页即出现「MCP 与技能管理面板」入口。
 
-> 🎯 适配 DSH `0.1.5-rc2`；更早版本的 DSH 请先升级 DSH，再安装/更新本插件。
+> 🎯 **适配 DSH `0.1.5-rc2` ~ `0.2.0-rc2`**（含桌面端）。低于 `0.1.5-rc2` 请先升级 DSH；`0.2.0` 起 preset 不再落盘，面板改从 standing 树直读（见「0.2.0 数据源迁移」）。
 
 > 📦 已发布到 **npm**：`dsh-mcp-skill-panel`（[npm 页面](https://www.npmjs.com/package/dsh-mcp-skill-panel)）。npm 版为预构建产物，安装可跳过 `allowBuilds` 构建授权，也可直接以包名安装；git 源方式始终可用。
 >
@@ -256,6 +259,8 @@ sequenceDiagram
 ## ⚠️ 已知限制
 
 - 启停作用于 preset 层：一个服务器/技能的开关影响该 preset 下所有会话。
+- **0.2.0 起 preset 不落盘**：面板数据源改为 standing 树直读，state.json 的行来源键由「预设文件路径」变为 `preset:<presetId>`（旧键在首次写入后自然废弃，`syncPresetFiles` 对非文件键是 no-op）。此时**「手动编辑预设文件」这条交互不存在**（没有文件可编辑），外部改动检测随之退化为「live 事实 vs 记录值」。
+- **模块实例身份仍是硬约束**：`livePresetMounts()` 的挂载表是 agent-presets 包内**模块私有** Set，本插件必须解析到宿主同一份物理实例才能看到挂载。解析基准优先 `ctx.baseUrl`，另有 `standingMountFor` 捕获兜底；判读面见 `/debug` 的 `standingDiag.presetApi`。
 - 无 frontmatter 的 SKILL.md 无法切换（provider 本身会忽略此类文件）。
 - 工具数/token 为估算值（`JSON.stringify(parameters).length / 4`），与模型注入面真实值近似。
 - 停用后工具立即消失，但**当前回合的请求缓存**（如有）可能仍引用旧 schema；下一请求自然刷新。
@@ -286,6 +291,19 @@ npm run selftest:mcp        # catalog / convert / preset 纯逻辑单测（含 c
 npm run selftest:pending    # P1 会话边界应用链单测
 ```
 
+**0.2.0 宿主真机验收**（可选，需要本机装了 DSH Desktop / 有 app.asar）：
+
+```sh
+npm run verify:host020
+# app.asar 位置会自动探测；非标准安装位置用 DSH_ASAR 显式指定：
+# DSH_ASAR="C:\...\resources\app.asar" npm run verify:host020
+```
+
+它从 app.asar 里解出**宿主真实现**并断言 5 组事实：兼容门放行本 manifest、
+旧包名在 0.2.0 上不可解析（原 bug 现场）、registry 导出两个读取口、
+`lib/index.js` 在 0.2.0 运行时下可加载、产物里已无 agent-presets 静态 import。
+（不用复刻 semver 来"验证"自己 —— 复刻等价实现做自证等于自我欺骗。）
+
 > **lib/ 产物由 GitHub Actions 自动重建**（`.github/workflows/build.yml`）：提交源码后推送，CI 跑 typecheck→build→verify→selftest，在 main 分支把新 `lib/` 以 `[skip ci]` 提交回写；本地记得 pull 收产物。
 > 为什么 `--legacy-peer-deps`：运行时 peer 由 DSH 闭包注入，而 registry 上 rc.6~rc.8 的 peer 声明互相咬（ERESOLVE）；为什么 `--ignore-scripts`：esbuild 走 optionalDependencies 平台二进制、无需 postinstall。
 
@@ -293,6 +311,89 @@ node 半区 tsdown 必须 `external: [/^@deepseek-ai\//]`：内联 dsh-tools 会
 `build.mjs` 的顺序必须是「tsdown → tsc dts」：tsdown 的 `clean` 会清掉 `lib/`，若先 tsc 生成、后 tsdown，`lib/types` 会被连带删除（0.4.7 修复，verify 有护栏）。
 
 ## 📋 变更日志
+
+### v0.7.0（2026-10）— DSH 0.2.0 适配（数据源迁移）+ 桌面端可安装
+
+> 触发场景：在 **DSH Desktop 0.2.0-rc.2** 上安装本插件时，桌面插件管理器直接拒绝：
+> `installation rejected: Plugin dsh-mcp-skill-panel@0.6.0 is incompatible with dsh 0.2.0-rc.2:
+> peerDependencies {"@deepseek-ai/dsh-scope":"^0.1.2-rc.1"}`。
+> 绕过版本门也没用 —— 0.2.0 的模块图里旧包名根本不存在。
+
+#### 🔴 两个各自独立的阻断点
+
+| # | 症状 | 根因 |
+| --- | --- | --- |
+| ① | 插件管理器拒绝安装 | 0.2.0 新增插件兼容门（`dsh-app-boot` 的 `evaluatePluginCompatibility`）：把插件**每一个** `@deepseek-ai/dsh*` peer 与运行时做 semver 比对。`^0.1.2-rc.1` 对 `0.2.0-rc.2` 不满足（0.x 的 `^` 只允许 `0.1.x`） |
+| ② | 即使放行安装也会崩 | `src/standing-rows.ts` 顶部**静态** `import * as agentPresets from '@deepseek-ai/dsh-agent-presets'` —— 0.2.0 把该包拆成 `dsh-agent-preset`（纯插件）+ `dsh-agent-preset-registry`（服务与读取口），旧包名**不存在** → 模块图加载期 `ERR_MODULE_NOT_FOUND`，插件内部的 try/catch 降级设计来不及生效 |
+
+#### 🔧 修法一：模块解析改为运行期动态解析（`agent-preset-compat.ts`，新增）
+
+- 静态 import 改为 `createRequire` 按顺序解析两个候选包名（**新名优先**，旧名仅作 0.1.x 回落）。
+- 解析基准优先取 **`ctx.baseUrl`** —— 宿主挂载 preset 走的是
+  `mountPreset(scope.ctx.extend({ baseUrl: record.context.baseUrl }), …)`
+  （registry `lib/index.js:534`），用同一基准建 require 才落在宿主**同一份物理实例**上。
+- ⚠️ **为什么实例身份是硬约束**：`livePresetMounts()` 背后是包内**模块私有**
+  `const mounts = new Set()`（0.1.2-rc.1 `lib/index.js:695`、0.2.0-rc.2 `lib/index.js:78`），
+  没有 `globalThis` / `Symbol.for` 之类的跨实例通道（实测两份拷贝的
+  `livePresetMounts !== livePresetMounts`）。解析错实例不报错，只是**静默返回空表**。
+- 双保险：`captureStandingMount()` 在 `apply` 里经模块级
+  `standingMountFor(agentCtx)` 捕获一份挂载；`standingMounts()` 首选
+  `livePresetMounts()`，空则并入捕获的挂载。
+- `/debug` 的 `standingDiag.presetApi` 新增取证面（命中的包名 / 实例路径 / 解析基准 / 失败清单）。
+
+#### 🔧 修法二：数据源迁移 —— 从「preset 文件文本」改为「standing 树直读」（`preset-live.ts`，新增）
+
+0.2.0 不只改名，还把插件赖以工作的**文件面整个砍掉**：
+
+| 插件原本依赖 | 0.1.2-rc.1 | 0.2.0-rc.2 |
+| --- | --- | --- |
+| `ctx.agentPresets.standingKeyFor()` | ✅ | ❌ 已删除（改 `acquireScope()` 返回带 dispose 的租约） |
+| `ctx.agentPresets.resolve(id).path` | ✅ 绝对路径 | ❌ `AgentPreset` **不再有 path**（新包 .d.ts 里一个路径字段都没有） |
+| `ctx.agentPresets.read(id)` | ✅ 返回文件文本 | ❌ **方法已删除**（只剩 `readDocument()`） |
+| `compositionInventory()` / `composedPreset()` | ✅ | ✅ 仍在（`AgentPresetComposition` 去掉了 `trust` 字段 —— 本插件未用） |
+
+后果：0.6.0 的 `listPresetMcpRows` 会直接 `throw preset "…" has no path` → **整条 `/state` 500、面板 MCP 页全空**。
+且 desktop profile 的 preset 是**内联在 `cordis.yml`** 的 loader 行，磁盘上压根没有 `agent.cordis.yml` 可读。
+
+- 新数据源：`livePresetRows()` 直读 standing 树的 `entry.options.config` —— 那是 loader
+  **已求值**的挂载配置（`!!js` 是真值），比「正则抓文本 + 自行求值」更准。
+- **0.1.x / web 行为逐字节不变**：`resolve(id).path` 仍存在时依旧走文件面
+  （`listPresetMcpRowsOrThrow` 保留原契约，`findPresetRowByServerName` 仍对未知 preset 抛错）。
+- state.json 行来源键由「预设文件绝对路径」泛化为 **`presetKey`**：有文件时 = 文件路径，
+  否则 = `preset:<presetId>`。`syncPresetFiles` 对非文件键天然 no-op（`readFile` 失败即跳过），
+  0.2.0 的持久化由 standing 行自身的 `entry.update({ disabled })` 承担。
+- `applyStateResidue` 同步改造：无文件时按 `preset:<id>` 取键、外部改动判据退化为
+  「live 事实 vs 记录值」（此时没有第三方文本可被编辑）。
+- **面板不再因单个异常 preset 打空**：`listPresetMcpRows` 改为空表 + 稳定键，严格版另立
+  `listPresetMcpRowsOrThrow`（调用方需要区分「preset 不存在」时用）。
+
+#### 🔧 修法三：peer 声明放宽到实测范围
+
+```jsonc
+"@deepseek-ai/dsh": ">=0.1.5-rc.0 <0.3.0-0",
+"@deepseek-ai/dsh-scope": ">=0.1.2-rc.1 <0.3.0-0",
+"@deepseek-ai/dsh-agent-presets": ">=0.1.2-rc.1",              // optional
+"@deepseek-ai/dsh-agent-preset-registry": ">=0.1.7-rc.1 <0.3.0-0" // optional，新名
+```
+
+`@deepseek-ai/cordis` / `schemastery` 保持原样（`^` 对 4.x / 3.x 正常放行）。
+
+#### ✅ 本轮验证（都是**跑出来**的，不是读代码推的）
+
+| 验证项 | 手段 | 结果 |
+| --- | --- | --- |
+| 兼容门放行 | 用宿主**真** `evaluatePluginCompatibility` + 真运行时版本 `0.2.0-rc.2` 判定 `package.json` | PASS（旧声明在同一运行时下被拒，对照成立） |
+| 模块图可加载 | 把构建产物放进 0.2.0-rc.2 **打包运行时**的 node_modules 邻居，用打包 runtime 的 V8 `import lib/index.js` | PASS（`apply` 为 function，83 个导出） |
+| 旧包名在 0.2.0 上不存在 | 移除旧包后 `require.resolve` | `MODULE_NOT_FOUND`（正是原 bug） |
+| 解析器选对实例 | 两个包名同时存在时复现选择逻辑 | 选 `dsh-agent-preset-registry`（新名优先） |
+| live 行映射 | `livePresetRowsToRows` 纯逻辑断言（含 `!!js` 求值后的 env 真值、streamable-http、不可挂载行回落） | 3 组断言 PASS |
+| 全量闸门 | `typecheck` → `build` → `verify` → 三个 selftest | 全绿（mcp 120 项） |
+
+#### 📌 装机注意
+
+- **桌面端**：必须重启 DSH Desktop（bundle 层只在启动时合成）。
+- 若你此前为 0.6.0 授予过 **exact-version exemption**，可撤销（`0.7.0` 已不需要）：
+  设置 → 插件，或 `dsh plugin --profile desktop revoke-version dsh-mcp-skill-panel@0.6.0 --dsh-version 0.2.0-rc.2`。
 
 ### v0.6.0（2026-09-16）— 首个公开发布
 

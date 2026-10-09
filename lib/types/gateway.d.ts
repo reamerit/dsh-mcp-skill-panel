@@ -90,6 +90,7 @@ export interface GatewayDeps {
     listRows?: (ctx: Context, presetId: string) => Promise<{
         rows: GatewayPresetRow[];
         presetPath: string;
+        presetKey: string;
     }>;
     readIntents?: () => Promise<Record<string, {
         desired?: boolean;

@@ -28,12 +28,27 @@ if (existsSync(nodeOut)) {
   check(inline === 0, `no inlined TOOL_RUNTIME_SCHEDULER (found ${inline})`)
   check(/import\s*\{[^}]*scopeOf[^}]*\}\s*from\s*"@deepseek-ai\/dsh-scope"/.test(src), 'external dsh-scope import kept')
   check(/import\s+Schema\s+from\s*"@deepseek-ai\/schemastery"/.test(src), 'external schemastery import kept')
-  // 0.5.7 回归：agent-presets 必须外置。它内部用**模块私有 WeakMap** 记录 standing
-  // 挂载（lib/index.js:622 mounted / :639 mounted.set），内联成第二份实例会让
-  // livePresetMounts() 恒返回 []，preset 行句柄再次失联 —— 与 dsh-tools 双实例同类事故。
+  // 0.5.7 回归：agent-presets 系列的挂载记录是**模块私有** Set（0.1.x lib/index.js:695、
+  // 0.2.x registry lib/index.js:78），内联成第二份实例会让 livePresetMounts() 恒返回 []，
+  // preset 行句柄再次失联 —— 与 dsh-tools 双实例同类事故。
+  //
+  // 0.7.0 起**不能**再用「静态 import 字符串」判定：0.2.0 删掉了旧包名，静态 import
+  // 会在模块图加载期 ERR_MODULE_NOT_FOUND，故改为 createRequire 动态解析
+  // （src/agent-preset-compat.ts）。护栏随之改成两条更本质的断言：
+  //   ① 两个候选包名都出现在产物里（证明解析器没被摇掉）；
+  //   ② **没有**静态 import 这两个包（静态 import 是 0.2.0 上必崩的写法）。
   check(
-    /from\s*"@deepseek-ai\/dsh-agent-presets"/.test(src),
-    'external dsh-agent-presets import kept (inlining breaks preset row handles)',
+    src.includes('@deepseek-ai/dsh-agent-preset-registry') && src.includes('@deepseek-ai/dsh-agent-presets'),
+    'agent-presets 双包名解析器保留（0.1.x 旧名 + 0.2.x registry）',
+  )
+  check(
+    !/^\s*import\s[^\n]*from\s*["']@deepseek-ai\/dsh-agent-presets?["']/m.test(src) &&
+      !/^\s*import\s[^\n]*from\s*["']@deepseek-ai\/dsh-agent-preset-registry["']/m.test(src),
+    'no static import of agent-presets (0.2.0 removed the old name; must stay dynamic)',
+  )
+  check(
+    /createRequire/.test(src),
+    'agent-presets resolved through createRequire (external instance keeps module identity)',
   )
 }
 
@@ -67,6 +82,22 @@ if (existsSync(clientOut)) {
         /export\s*\{[^}]*sessionField/.test(src),
       'session-scope exports readCurrentSession / withSessionParam / sessionField',
     )
+  }
+}
+
+// 0.7.0：预设文本工具同样是独立产物（selftest 直接加载），**不得引入任何宿主包**。
+// 0.7.0 起它合法地 import `node:os` / `node:path`（来自 preset.ts），故判据是
+// 「非 node: 前缀的 import 必须为零」而不是「零 import」。
+{
+  const presetTextOut = join(root, 'lib', 'preset-text.js')
+  if (check(existsSync(presetTextOut), `preset-text standalone bundle exists: ${presetTextOut}`)) {
+    const src = readFileSync(presetTextOut, 'utf8')
+    const bare = [...src.matchAll(/^\s*import\s[^\n]*?from\s*["']([^"']+)["']/gm)]
+      .map((m) => m[1])
+      .filter((s) => !s.startsWith('node:'))
+    check(bare.length === 0, `preset-text has no host-package imports (found ${bare.join(', ') || 'none'})`)
+    check(/livePresetRowsToRows/.test(src), 'preset-text exports livePresetRowsToRows (0.2.0 数据源映射)')
+    check(/presetKeyOf/.test(src), 'preset-text exports presetKeyOf (state.json 行来源键)')
   }
 }
 

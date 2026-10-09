@@ -25,42 +25,47 @@
  * `enabled === false` 一一对应（实测 10/10 一致），故 rc.8 时代的
  * `entry.update({ disabled })` 语义**原样复活**。
  *
- * ⚠️ 模块身份（本文件成立的前提）：`mounted` 是 dsh-agent-presets 的**模块私有**
- * WeakMap，`livePresetMounts()` 只有当本插件的 `@deepseek-ai/dsh-agent-presets`
- * 与宿主组合解析到**同一份实例**时才看得到挂载。实测：宿主侧走 `NODE_PATH` 的
- * `node_modules/.pnpm/node_modules` 影子树 → 0.1.5-rc.2
- * (`...@deepseek-ai+dsh-agent-pres_fc9bf98ae5865ea9f109f84a7d78519a`)；面板从
- * 自身 node_modules 向上走解析到同一份（探针 presets.url 实证）。
- * **若升级 DSH 后 `presetMounts()` 恒返回 []，第一嫌疑就是这份实例错位**——
- * 由 `/debug` 的 `standingDiag` 直接可见，不要靠猜。
+ * ⚠️ 模块身份（本文件成立的前提）：`mounted` 是 agent-presets 的**模块私有**
+ * WeakMap/Set，`livePresetMounts()` 只有当本插件解析到与**宿主同一份物理实例**
+ * 时才看得到挂载。
+ *
+ * 0.7.0 起这条约束由两个机制共同保证，不再靠部署布局巧合：
+ *   1. `agent-preset-compat.ts` 按 `ctx.baseUrl`（宿主挂载 preset 用的同一基准）
+ *      建 require 解析，优先落在宿主那一份实例上；
+ *   2. `captureStandingMount()` 在 `apply` 里经 `ctx.agentPresets.standingMountFor()`
+ *      捕获一份挂载 —— 该路径走宿主**服务对象**，与模块实例无关，是实例错位时的
+ *      兜底（`presetMounts()` 首选 `livePresetMounts()`，空则并入捕获的挂载）。
+ *
+ * 若升级 DSH 后 standing 行为空，第一嫌疑仍是实例错位 —— 由 `/debug` 的
+ * `standingDiag.presetApi`（命中的包名 / 实例路径 / 解析基准 / 失败清单）直接可见。
  *
  * 边界：本模块只做「定位 + 句柄交付」，不改任何状态；写操作只发生在调用方
  * （routes 的 entry.update / mcpcall 的 ensureEnabled）。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Entry } from '@deepseek-ai/cordis-plugin-loader'
-import * as agentPresets from '@deepseek-ai/dsh-agent-presets'
+import {
+  resolveAgentPresetApi,
+  presetApiDiag,
+  type AgentPresetModuleApi,
+  type StandingMount,
+  type StandingTree,
+} from './agent-preset-compat'
 import { isMcpEntry, serverNameOf } from './mcp-entry'
 
-/** standing 组合的挂载描述（只取本插件用到的字段）。 */
-export interface StandingMount {
-  presetId?: string
-  tree?: StandingTree
-}
-
-/** standing 组合的 EntryTree（PresetTree extends Include 的公开子集）。 */
-export interface StandingTree {
-  entries(): Iterable<Entry>
-  resolve?(id: string): Entry
-}
+export type { StandingMount, StandingTree } from './agent-preset-compat'
 
 /**
- * dsh-agent-presets 的读取面。全部可选：宿主版本落后（< 0.1.5-rc.2）时这些函数
- * 不存在，面板整体降级为 0.5.6 行为（可见性不过滤、开关只记意图），不崩。
+ * agent-presets 读取面。**异步解析**（模块图不能在顶层静态 import 旧包名，
+ * 见 agent-preset-compat.ts 的模块注释）。解析完成前 `presetMounts()` 返回 []，
+ * 面板按 0.5.6 降级行为显示；`ensureAgentPresetApi()` 应在插件 `apply` 里 await。
  */
-const api = agentPresets as unknown as {
-  livePresetMounts?: (within?: unknown) => StandingMount[]
-  standingMountFor?: (agentCtx: Context) => StandingMount | undefined
+let api: AgentPresetModuleApi = {}
+
+/** 解析一次并缓存（幂等，可重复 await）。 */
+export async function ensureAgentPresetApi(ctx?: Context): Promise<void> {
+  const resolved = await resolveAgentPresetApi(ctx)
+  if (Object.keys(resolved).length > 0 || Object.keys(api).length === 0) api = resolved
 }
 
 /** 诊断快照（/debug standingDiag 用；不参与任何逻辑判断）。 */
@@ -73,38 +78,73 @@ let diag: {
 } = { apiAvailable: false, apiError: null, mountsSeen: 0, lastPresetIds: [], lastRowCount: 0 }
 
 /**
- * 全进程所有 preset 的 standing 挂载（**无 agent 参数**，装配同步路径也可用）。
- * 过滤掉没有 tree / tree 无 entries() 的项（防御畸形挂载）。
+ * 本插件 `apply` 里经 `ctx.agentPresets.standingMountFor(...)` 捕获的挂载。
+ *
+ * 为什么需要它（**模块身份兜底**）：`livePresetMounts()` 读的是包里模块私有的
+ * `mounts` Set，只有解析到宿主**同一份物理实例**时才非空（见 agent-preset-compat.ts）。
+ * 而 `standingMountFor(agentCtx)` 走的是宿主服务对象上的方法，与实例无关。
+ * 因此捕获一份挂载即可绕开实例错位；`livePresetMounts()` 仍作首选的进程级枚举。
  */
-export function presetMounts(): StandingMount[] {
-  if (typeof api.livePresetMounts !== 'function') {
-    diag = { ...diag, apiAvailable: false, apiError: 'livePresetMounts not exported by host dsh-agent-presets' }
-    return []
-  }
-  try {
-    const raw = api.livePresetMounts()
-    const out: StandingMount[] = []
-    for (const m of Array.isArray(raw) ? raw : []) {
-      const tree = m?.tree
-      if (!tree || typeof tree.entries !== 'function') continue
-      out.push(m)
-    }
-    diag = { ...diag, apiAvailable: true, apiError: null, mountsSeen: out.length, lastPresetIds: out.map((m) => String(m.presetId ?? '')) }
-    return out
-  } catch (error) {
-    diag = { ...diag, apiAvailable: true, apiError: error instanceof Error ? error.message : String(error) }
-    return []
-  }
+let capturedMount: StandingMount | undefined
+
+/** 由 `apply` 早期捕获 standing 挂载（取不到属正常路径：rc.4 会话无挂载时为 undefined）。 */
+export function captureStandingMount(mount: StandingMount | undefined): void {
+  if (mount?.tree && typeof mount.tree.entries === 'function') capturedMount = mount
 }
 
 /**
- * 在 standing 树里按 serverName 找 MCP 行。先遍历 `livePresetMounts()`；
- * 无挂载且给了 agentCtx 时再用 `standingMountFor(agentCtx)` 兜一次
+ * 全进程所有 preset 的 standing 挂载。
+ *
+ * 顺序：`livePresetMounts()`（进程级、覆盖全部 preset）→ 捕获的挂载（实例错位兜底）。
+ * 两侧都过滤掉没有 tree / tree 无 entries() 的项（防御畸形挂载）。
+ */
+export function standingMounts(): StandingMount[] {
+  const out: StandingMount[] = []
+  const seen = new Set<string>()
+  if (typeof api.livePresetMounts === 'function') {
+    try {
+      const raw = api.livePresetMounts()
+      for (const m of Array.isArray(raw) ? raw : []) {
+        if (!m?.tree || typeof m.tree.entries !== 'function') continue
+        const key = String(m.presetId ?? '')
+        if (key.length > 0 && seen.has(key)) continue
+        if (key.length > 0) seen.add(key)
+        out.push(m)
+      }
+      diag = { ...diag, apiAvailable: true, apiError: null }
+    } catch (error) {
+      diag = { ...diag, apiAvailable: true, apiError: error instanceof Error ? error.message : String(error) }
+    }
+  } else if (Object.keys(api).length === 0) {
+    // 解析尚未完成（apply 的 await 之前）或彻底失败 —— 两种情况都走空表降级，
+    // 但把原因写进诊断，避免「面板静默为空」变成靠猜。
+    diag = {
+      ...diag,
+      apiAvailable: false,
+      apiError: presetApiDiag.errors.length > 0
+        ? presetApiDiag.errors.join(' | ')
+        : 'agent-presets module not resolved yet',
+    }
+  } else {
+    diag = { ...diag, apiAvailable: false, apiError: 'livePresetMounts not exported by host agent-presets module' }
+  }
+  if (capturedMount?.tree && typeof capturedMount.tree.entries === 'function') {
+    const key = String(capturedMount.presetId ?? '')
+    if (key.length === 0 || !seen.has(key)) out.push(capturedMount)
+  }
+  diag = { ...diag, mountsSeen: out.length, lastPresetIds: out.map((m) => String(m.presetId ?? '')) }
+  return out
+}
+
+
+/**
+ * 在 standing 树里按 serverName 找 MCP 行。先枚举全部 standing 挂载；
+ * 空表且给了 agentCtx 时再用 `standingMountFor(agentCtx)` 兜一次
  * （带 agent 的调用方更精确，但不依赖它——RC.4 会话无挂载时为 undefined）。
  * 命中规则与 loader 侧一致（isMcpEntry + serverNameOf），两条路径同语义。
  */
 export function findStandingEntryByServer(serverName: string, agentCtx?: Context): Entry | undefined {
-  const mounts = presetMounts()
+  const mounts = standingMounts()
   if (mounts.length === 0 && agentCtx !== undefined && typeof api.standingMountFor === 'function') {
     try {
       const mount = api.standingMountFor(agentCtx)
@@ -124,7 +164,7 @@ export function findStandingEntryByServer(serverName: string, agentCtx?: Context
 
 /** 在 standing 树里按长 entryId 找行（toggleMcp 直传 entryId 时用）。 */
 export function findStandingEntryById(entryId: string): Entry | undefined {
-  for (const mount of presetMounts()) {
+  for (const mount of standingMounts()) {
     for (const entry of safeEntries(mount.tree)) {
       if (String(entry.id) === entryId) return entry
     }
@@ -135,7 +175,7 @@ export function findStandingEntryById(entryId: string): Entry | undefined {
 /** 全部 standing MCP 行（可见性层用：需同时覆盖 open 与 closed 两种行）。 */
 export function standingMcpEntries(): Entry[] {
   const out: Entry[] = []
-  for (const mount of presetMounts()) {
+  for (const mount of standingMounts()) {
     for (const entry of safeEntries(mount.tree)) {
       if (!isMcpEntry(entry)) continue
       out.push(entry)
@@ -145,8 +185,27 @@ export function standingMcpEntries(): Entry[] {
   return out
 }
 
-/** 一行 MCP 的安装态摘要（mcp_search 的「已安装能力表」用）。 */
-export interface InstalledMcpRow {
+/**
+ * 该 live 行所属 preset 的 id（多 preset 时逐挂载查找 entry.id 命中）。
+ *
+ * 用途：0.2.0 起 preset 不再有组合文件，state.json 的行来源键由「绝对路径」
+ * 退化为 `preset:<id>`（见 preset-mcp.ts 的 `presetKeyOf`），而 live 行本身
+ * 只带 entryId —— 需要反查它属于哪个 preset 才能算出同一个键。
+ * @param entry - standing 树里的行句柄。
+ * @returns preset id；找不到返回 ''。
+ */
+export function presetIdOfEntry(entry: Entry): string {
+  const id = String(entry?.id ?? '')
+  if (!id) return ''
+  for (const mount of standingMounts()) {
+    for (const row of safeEntries(mount.tree)) {
+      if (String(row.id) === id) return String(mount.presetId ?? '')
+    }
+  }
+  return ''
+}
+
+/** 一行 MCP 的安装态摘要（mcp_search 的「已安装能力表」用）。 */export interface InstalledMcpRow {
   serverName: string
   entryId: string
   /** 用户在面板的开关：true = 开着（模型可见、运行中） */
@@ -187,7 +246,31 @@ function safeEntries(tree: StandingTree | undefined): Entry[] {  if (!tree) retu
   }
 }
 
-/** /debug 诊断读数（只读快照，外部改不到内部状态）。 */
-export function standingDiag(): typeof diag {
-  return { ...diag }
+/**
+ * /debug 诊断读数（只读快照，外部改不到内部状态）。
+ *
+ * `presetApi` 段是 0.7.0 新增：模块解析命中的包名/实例路径/解析基准/失败清单。
+ * 「面板 MCP 行为空」的第一嫌疑仍是实例错位（`mounts` 是包内模块私有 Set），
+ * 这里直接给出取证面，不要靠猜（判读：`specifier` 为 null 或 `mountsSeen === 0`
+ * 而 `capturedMount` 有值 ⇒ 解析到的不是宿主那一份实例）。
+ */
+export function standingDiag(): typeof diag & {
+  presetApi: {
+    specifier: string | null
+    resolvedPath: string | null
+    base: string
+    errors: string[]
+    hasCapturedMount: boolean
+  }
+} {
+  return {
+    ...diag,
+    presetApi: {
+      specifier: presetApiDiag.specifier,
+      resolvedPath: presetApiDiag.resolvedPath,
+      base: presetApiDiag.base,
+      errors: [...presetApiDiag.errors],
+      hasCapturedMount: capturedMount !== undefined,
+    },
+  }
 }

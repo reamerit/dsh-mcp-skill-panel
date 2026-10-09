@@ -14,3 +14,7 @@ export {
   configKeysToYamlText,
   EDITABLE_CONFIG_KEYS,
 } from './preset'
+
+// 0.7.0 数据源迁移的纯映射：live 树行 → 面板行（0.2.0 唯一可用面）。
+// 与上面同理必须零宿主依赖 —— 该函数只做字段搬运，不 import 任何宿主包。
+export { livePresetRowsToRows, presetKeyOf } from './preset-mcp'

@@ -139,7 +139,7 @@ export interface GatewayDeps {
    * WARN-3（复审，2026-09-10）：自测读不到真 state.json（进程缓存）且 fake
    * compositionInventory 空行，必须可注入才能覆盖拆分支。
    */
-  listRows?: (ctx: Context, presetId: string) => Promise<{ rows: GatewayPresetRow[]; presetPath: string }>
+  listRows?: (ctx: Context, presetId: string) => Promise<{ rows: GatewayPresetRow[]; presetPath: string; presetKey: string }>
   readIntents?: () => Promise<Record<string, { desired?: boolean; lastApplied?: boolean | null }>>
 }
 
@@ -211,21 +211,21 @@ export async function ensureOpenMounts(deps: GatewayDeps, presetId?: string): Pr
       deps.readIntents ??
       (async () => {
         const stateFile = await readState().catch(() => undefined)
-        return (presetPathRef.current ? stateFile?.mcp?.[presetPathRef.current] : undefined) ?? {}
+        return (presetKeyRef.current ? stateFile?.mcp?.[presetKeyRef.current] : undefined) ?? {}
       })
     let rows: GatewayPresetRow[] = []
-    const presetPathRef: { current: string } = { current: '' }
+    const presetKeyRef: { current: string } = { current: '' }
     try {
       const listed = await listRows(ctx, pid)
       rows = listed.rows
-      presetPathRef.current = listed.presetPath
+      presetKeyRef.current = listed.presetKey
     } catch (error) {
       state.lastCheck = { at: Date.now(), ok: false, detail: `listPreset failed: ${messageOf(error)}` }
       return out
     }
     // 关意图即拆：state.json desired=true 的已挂载行先 remove（只拆网关自己拉起的 mounts，
     // 官方行/项目行不在 mounts 账里，不碰）。意图来源与 toggle 网关分支同键
-    //（state.mcp[presetPath][rowId].desired，见 routes.ts:184）。
+    //（state.mcp[presetKey][rowId].desired，见 routes.ts:184）。
     // BLOCK-1（复审，2026-09-10）：intents 必须外提——挂载循环对 desired=true 的行
     // 直接跳过（计 skipped），否则拆后同轮立即重建，关净效果为零。
     let intents: Record<string, { desired?: boolean; lastApplied?: boolean | null }> = {}

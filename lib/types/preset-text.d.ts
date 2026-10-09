@@ -6,3 +6,4 @@
  * ERR_MODULE_NOT_FOUND。本入口只 re-export 纯文本函数，零宿主依赖。
  */
 export { setRowFlag, setRowConfigKeys, rowDisabledState, configValueToYaml, configSetToYaml, configKeysToYamlText, EDITABLE_CONFIG_KEYS, } from './preset';
+export { livePresetRowsToRows, presetKeyOf } from './preset-mcp';
