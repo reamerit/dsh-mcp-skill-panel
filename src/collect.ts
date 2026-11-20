@@ -15,6 +15,7 @@ import { serverOfMcp } from './catalog'
 import type { McpCallController } from './mcpcall'
 import type { CatalogRuntime } from './index'
 import { messageOf } from './util'
+import { firstRootAgent } from './agents-compat'
 import { readState, stateAutoManageByRoute, stateToolBudget } from './state'
 import { pendingMcp } from './pending'
 import { listPresetMcpRows } from './preset-mcp'
@@ -133,9 +134,10 @@ export function resolveAgent(ctx: Context, sessionId: string | undefined) {
     const byId = ctx.agents.get(sessionId as Parameters<typeof ctx.agents.get>[0])
     if (byId) return byId
   }
-  const roots = ctx.agents.roots()
-  if (roots.length > 0) return roots[0]
-  return ctx.agents.list()[0]
+  // 0.7.3：`ctx.agents.roots()` 在 DSH 0.2.2-rc.2 被删除（挂载即抛
+  // `ctx.agents.roots is not a function`）。roots[0]/list[0] 的选取规则收进
+  // ./agents-compat，旧宿主仍优先走 roots()，新宿主按 session.header 判定顶层。
+  return firstRootAgent(ctx)
 }
 
 /**

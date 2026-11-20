@@ -79,7 +79,7 @@ export declare function getSchemasView(ctx: Context, caches: DomainCaches, scope
     description?: unknown;
     parameters?: unknown;
 }>;
-export declare function resolveAgent(ctx: Context, sessionId: string | undefined): import("@deepseek-ai/dsh-agent").Agent;
+export declare function resolveAgent(ctx: Context, sessionId: string | undefined): import("@deepseek-ai/dsh-agent").Agent | undefined;
 export declare function resolveCollectScopeKey(ctx: Context, sessionId: string | undefined): Promise<object | undefined>;
 /** scope key 解析来源（/debug scopeDiag 展示用）。 */
 export declare function scopeKeySource(): 'agent' | 'standing' | null;

@@ -41,6 +41,7 @@ import { createMcpCallController, installMcpControlTools, inventoryTraceDiag } f
 import { isMcpEntry, serverNameOf, mcpEntryConfig } from './mcp-entry'
 import { standingMcpEntries, findStandingEntryByServer, installedMcpRows, ensureAgentPresetApi } from './standing-rows'
 import { presetApiDiag } from './agent-preset-compat'
+import { rootAgents, firstRootAgent } from './agents-compat'
 import { createGatewayState, disposeGatewayState, disposeGatewayStateSync, ensureOpenMounts } from './gateway'
 
 export { normalizeToolName, normalizeArguments, msgOf, gatewayCall } from './mcpcall'
@@ -370,7 +371,7 @@ async function snapshotEnabled(ctx: Context, runtime: CatalogRuntime, caches: Do
     let rootsCount = 0
     let listCount = 0
     try {
-      rootsCount = ctx.agents.roots().length
+      rootsCount = rootAgents(ctx).length
       listCount = ctx.agents.list().length
     } catch {
       rootsCount = -1
@@ -462,7 +463,7 @@ function buildMcpControl(ctx: Context, runtime: CatalogRuntime, config: Config, 
     serverName: string,
   ): Promise<PresetMcpRow | undefined> => {
     try {
-      const live = agent ?? ctx.agents.roots()[0] ?? ctx.agents.list()[0]
+      const live = agent ?? firstRootAgent(ctx)
       const presetId = live ? (ctx.agentPresets.composedPreset(live.ctx) ?? null) : null
       if (!presetId) return undefined
       const key = `${presetId}\0${serverName}`

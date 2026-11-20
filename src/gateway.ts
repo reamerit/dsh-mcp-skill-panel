@@ -19,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { McpControlCtx } from './mcpcall'
 import { MCP_SEARCH_TOOL, MCP_CALL_TOOL } from './mcpcall'
 import { messageOf } from './util'
+import { firstRootAgent } from './agents-compat'
 
 /** 网关行 entryId 前缀（连字符；冒号是 EntryTree.sep 不可用，见 B4）。 */
 export const GATEWAY_ENTRY_PREFIX = 'gw-mcp-'
@@ -192,7 +193,7 @@ export async function ensureOpenMounts(deps: GatewayDeps, presetId?: string): Pr
     let pid = presetId
     if (!pid) {
       try {
-        const live = ctx.agents.roots()[0] ?? ctx.agents.list()[0]
+        const live = firstRootAgent(ctx)
         pid = live ? (ctx.agentPresets.composedPreset(live.ctx) ?? undefined) : undefined
       } catch {
         pid = undefined
