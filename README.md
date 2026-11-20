@@ -140,7 +140,7 @@ dsh plugin --profile web add "github:reamerit/dsh-mcp-skill-panel#main"
 
 产物已入库（`lib/`），git 源一行安装，无需构建授权。安装后**重启 `dsh web`**（bundle 层在启动时合成，热更新无效），设置页即出现「MCP 与技能管理面板」入口。
 
-> 🎯 **适配 DSH `0.1.5-rc2` ~ `0.2.0-rc2`**（含桌面端）。低于 `0.1.5-rc2` 请先升级 DSH；`0.2.0` 起 preset 不再落盘，面板改从 standing 树直读（见「0.2.0 数据源迁移」）。
+> 🎯 **适配 DSH `0.1.5-rc2` ~ `0.2.2-rc2`**（含桌面端）。低于 `0.1.5-rc2` 请先升级 DSH；`0.2.0` 起 preset 不再落盘，面板改从 standing 树直读（见「0.2.0 数据源迁移」）；`0.2.2` 起 `ctx.agents.roots()` 被宿主删除，0.7.3 已改用 `agents.list()` + `SessionHeader` 判定顶层（见变更日志 v0.7.3）。
 
 > 📦 已发布到 **npm**：`dsh-mcp-skill-panel`（[npm 页面](https://www.npmjs.com/package/dsh-mcp-skill-panel)）。npm 版为预构建产物，安装可跳过 `allowBuilds` 构建授权，也可直接以包名安装；git 源方式始终可用。
 >
@@ -311,6 +311,54 @@ node 半区 tsdown 必须 `external: [/^@deepseek-ai\//]`：内联 dsh-tools 会
 `build.mjs` 的顺序必须是「tsdown → tsc dts」：tsdown 的 `clean` 会清掉 `lib/`，若先 tsc 生成、后 tsdown，`lib/types` 会被连带删除（0.4.7 修复，verify 有护栏）。
 
 ## 📋 变更日志
+
+### v0.7.3（2026-11）— DSH 0.2.2-rc.2 删除 `ctx.agents.roots()`，插件挂载即崩
+
+> 触发场景：在 dsh `0.2.2-rc.2` 的 web profile 上安装/升级本插件，插件整棵子树装载失败，
+> 设置页没有 MCP / Skill 面板。宿主报错原文：`ctx.agents.roots is not a function`。
+
+#### 先排除「安装通道」问题
+
+pnpm 安装本身 `exit=0`，包也确实落进了 `node_modules`，`bundle.patch` 与 `include:runtime-inventory` 行都在 ——
+**装的没问题，是挂载阶段抛的**。同时确认这不是 0.6.0 那个老问题（0.2.0 起就有的兼容门，
+被 `@deepseek-ai/dsh-scope: ^0.1.2-rc.1` 这类声明触发）：0.7.2 的 peer 范围
+（`@deepseek-ai/dsh: >=0.1.5-rc.0 <0.3.0-0` 等）在 0.2.2-rc.2 下判为**兼容**，能通过门。
+
+#### 根因：`AgentRegistry` 的公开读取面被再次收窄
+
+| | 0.1.2-rc.1 | 0.2.2-rc.2 |
+| --- | --- | --- |
+| `get(id)` / `list()` | 有 | 有 |
+| `roots(): Agent[]` | 有（`lib/types/index.d.ts:365`） | **已删除**（同名文件及整个宿主 `lib/**` 都搜不到 `roots(`） |
+
+插件把 `roots()` 当 `apply` 期的**入口**用（不是可选降级路径），共 4 处：
+`collect.resolveAgent`、`gateway.ensureOpenMounts`、`index` 的采集诊断与 `cachedPresetRow`。
+第一处直接抛 `TypeError` → `apply` 中断 → 行装载失败、面板不出现。
+
+> 为什么 0.7.0 那次适配没覆盖：0.7.0 只处理了 `agentPresets` 服务的删改
+> （`standingKeyFor` 移除、包拆成 `dsh-agent-preset` + `dsh-agent-preset-registry`），`agents` 服务当时没动。
+
+#### 修法：`src/agents-compat.ts` 作为唯一 `roots()` 调用点
+
+- **旧宿主（≤ 0.2.1）**：`roots()` 在场就原样沿用 —— 0.1.x / 0.2.0 行为逐字节不变；
+- **新宿主（0.2.2+）**：改用 `list()` + `SessionHeader` 的**持久**判据挑顶层：
+  - `origin === 'subagent'` → 排除。`SessionHeader` 原注释明确「`parentSession` 的存在本身不能判定子代理，
+    要用 `origin`」（普通 fork 也带 `parentSession`），故**不认** `parentSession`；
+  - `delegationDepth > 0` → 排除（顶层缺省 =0，子代理 = 父层 +1）。
+- **降级只允许更宽松**：过滤为空 → 回落整张 `list()`，与旧写法 `roots()[0] ?? list()[0]` 同义；
+  服务缺失 / `list()` 抛错 → `[]` 且不抛。绝不允许「读不到 header 就让面板失去 agent」。
+
+#### 验证
+
+| 检查 | 手段 | 结果 |
+| --- | --- | --- |
+| 兼容层六分支 | 单测：旧 `roots` 优先 / 新宿主过滤子代理 / fork 保留 / header 缺失兜底 / `roots` 抛错 / `list` 抛错 | 全过 |
+| 编译与产物 | `tsc` + `build` + `verify` + 4 个 selftest（mcp 120 项） | 全绿 |
+| 真机装载 | 0.2.2-rc.2 web profile：`list_plugins` 读 `include:runtime-inventory` | `fiberPhase: active` |
+| 真机会话解析 | `GET /api/mcp-skill-panel/state` | 200，返回真实 `sessionId` / `preset: standard` / `cwd`，10 条 MCP 行 |
+| 产物自证 | 安装包 `lib/index.js` 里 `agents.roots` 出现次数 | **0**（`isTopLevelAgent` 在） |
+
+决策与取舍另见 `decisions/implemented/2026-11-20-agents-roots-removed-in-0-2-2.md`。
 
 ### v0.7.2（2026-10）— 项目 MCP 跨工作区可见性：补上此前完全没有测试的那条链路
 

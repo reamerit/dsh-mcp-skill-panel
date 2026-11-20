@@ -128,12 +128,12 @@ With the AI middle layer (`autoManage`) on, the model reaches disabled MCP serve
 ## 📦 Install
 
 ```sh
-dsh plugin --profile web add "github:lilyblessing/dsh-mcp-skill-panel#main"
+dsh plugin --profile web add "github:reamerit/dsh-mcp-skill-panel#main"
 ```
 
 Prebuilt artifacts are committed (`lib/`), so the git-source one-liner installs without a build step. **Restart `dsh web`** after installing (bundles are composed at startup; hot reload does not apply), then open Settings → **MCP & Skill Manager**.
 
-> 🎯 Targets DSH `0.1.5-rc2`; on earlier DSH versions, upgrade DSH first, then install/update this plugin.
+> 🎯 Targets DSH `0.1.5-rc2` through `0.2.2-rc2` (desktop included). On earlier DSH versions, upgrade DSH first, then install/update this plugin. Since `0.2.2` the host no longer exposes `ctx.agents.roots()`; 0.7.3 reads `agents.list()` and classifies top-level agents through `SessionHeader` instead (see changelog 0.7.3).
 >
 > 📦 Also published on **npm**: `dsh-mcp-skill-panel` ([npm page](https://www.npmjs.com/package/dsh-mcp-skill-panel)). The npm release ships prebuilt artifacts and can be installed by package name, skipping the `allowBuilds` approval; the git-source one-liner above always works.
 >
@@ -284,10 +284,11 @@ The node-half tsdown build must use `external: [/^@deepseek-ai\//]`: inlining ds
 
 ## 📋 Changelog
 
-> Coverage note: this table lists selected versions only — entries for `0.5.1`–`0.5.5` are missing (a pre-existing gap, not introduced here). The authoritative, complete changelog is the Chinese `README.md` §📋 变更日志.
+> Coverage note: this table lists selected versions only — entries for `0.7.0`–`0.7.2` and `0.5.1`–`0.5.5` are missing (a pre-existing gap, not introduced here). The authoritative, complete changelog is the Chinese `README.md` §📋 变更日志.
 
 | Version | Content |
 | --- | --- |
+| 0.7.3 | Compatibility fix for **DSH `0.2.2-rc.2`**, where the plugin failed to mount with `ctx.agents.roots is not a function`. The host's `AgentRegistry` dropped `roots()` entirely (present in `0.1.2-rc.1` `lib/types/index.d.ts:365`, absent in `0.2.2-rc.2`), and the plugin called it as an `apply`-time entry point in four places (`collect.resolveAgent`, `gateway.ensureOpenMounts`, the collection diagnostics and `cachedPresetRow`), so the throw killed the whole subtree. New `src/agents-compat.ts` is the single call site: old hosts (≤ `0.2.1`) keep using `roots()` byte-for-byte, new hosts pick top-level agents from `list()` via the durable `SessionHeader` predicates (`origin !== 'subagent'`, `delegationDepth <= 0`), fall back to the whole `list()` when nothing classifies, and return `[]` instead of throwing. Verified on `0.2.2-rc.2`: row active, `/api/mcp-skill-panel/state` returns real session/preset/cwd. Full changelog (zh): `README.md` §📋 变更日志 |
 | 0.6.0 | First public release (2026-09-16), folding in the pre-release development line (never published). Highlights: control tools renamed to **`dsh_mcp_search` / `dsh_mcp_call`** (the upstream gateway parses an `mcp_` prefix as an MCP tool and returns 400); **effective stats** (tool-level enabled count + token estimate, same predicate as the assembly filter); **`toolBudget`** tool-count red line over all tools, preferring the request-face count (`toolsAllSource` states the source); **per-model middle layer** (`autoManageByRoute`, edited one key at a time via `routeOverride`); **`middleLayerHides`** hidden range (`'disabled'` / `'all'`); **bulk tool control** (filter + disable/enable all or the filtered set, through the three-state `toolNames` contract); **"More config…"** per-row mount-config editing with live apply plus intent materialized into the preset at startup; **honest reporting** of rows that are enabled and running yet register 0 tools; **AI-temporary enable made distinguishable** (`aiOwned` badge); `POST /mcp/applyPending` now requires an explicit `{ confirm: true }` and the panel button asks for confirmation first. Full changelog (zh): `README.md` §📋 变更日志 |
 | 0.5.0 | Prompt Cache optimization (P0+P1, issue #1): mid-session toggle miss warning banner (red severe variant for large packs, 12s auto-dismiss); apply-timing immediate / next-session (the latter records intent into a pending queue, applied at `agent/session-start` or on restart materialization — zero miss for the current session); toggles coalesced into a single toggleBatch (single invalidateMcp); applyPendingMcp state-residue fallback (rows with desired ≠ live after restart/hot-reload are applied; externally modified rows are respected and cleared) + new selftest-pending chain test (in CI); toggleBatch partial failures no longer abort the batch; updated cover image |
 | 0.4.9 | Dependency alignment to the DSH rc.8 line (full pipeline verified on rc.8): 10 `@deepseek-ai/*` devDeps 0.1.0-rc.6 → 0.1.0-rc.8, peers tightened (cordis ^4.0.1 stable / schemastery ^3.18.1 / dsh-scope ^0.1.0-rc.8); published on npm (first release 0.4.8, `repository` points back here) + new Trusted Publishing pipeline (publish.yml, OIDC, tokenless) |
